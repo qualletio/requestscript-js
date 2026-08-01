@@ -101,8 +101,40 @@ export class Parser {
       segments.push(this.expectPathSegment('in the contract path'));
     }
     const name = segments.pop()!;
+    const version = this.match('@') ? this.parseContractVersion() : '1';
     const parameters: ParameterDecl[] = this.check('(') ? this.parseParameterList() : [];
-    return { kind: 'contract', path: segments, name, parameters };
+    return { kind: 'contract', path: segments, name, version, parameters };
+  }
+
+  /**
+   * Parses a dot-separated numeric version such as '2', '1.5', or '1.2.3'.
+   * The lexer splits 'x.y.z' into number and '.' tokens, so the version is
+   * reassembled from consecutive tokens; adjacency is checked so that
+   * whitespace does not silently join into one version.
+   */
+  private parseContractVersion(): string {
+    const numberToken = (): Token => {
+      const token = this.peek();
+      if (token.type !== 'int' && token.type !== 'decimal') {
+        throw this.error(`The contract version after '@' must be dot-separated numbers, e.g. '2' or '1.2.3'`, token);
+      }
+      return this.advance();
+    };
+    const adjacent = (previous: Token, next: Token): boolean =>
+      next.line === previous.line && next.column === previous.column + previous.value.length;
+
+    let previous = numberToken();
+    let version = previous.value;
+    while (this.check('.') && adjacent(previous, this.peek())) {
+      previous = this.advance(); // '.'
+      const next = this.peek();
+      if (!adjacent(previous, next)) {
+        throw this.error(`The contract version must not contain spaces`, next);
+      }
+      previous = numberToken();
+      version += `.${previous.value}`;
+    }
+    return version;
   }
 
   private parseParameterList(): ParameterDecl[] {

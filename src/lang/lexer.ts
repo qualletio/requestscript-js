@@ -93,7 +93,7 @@ export class Lexer {
       return this.token(two, two, line, column);
     }
 
-    if ('{}()[]:,.=<>!+-*/'.includes(ch)) {
+    if ('{}()[]:,.@=<>!+-*/'.includes(ch)) {
       this.advance();
       return this.token(ch as TokenType, ch, line, column);
     }

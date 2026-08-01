@@ -25,7 +25,7 @@ export interface ResourceFunction {
 }
 
 export interface Resource {
-  /** Dotted path such as 'path.to'; empty string for a path-less resource. */
+  /** Dotted path such as 'path.to'. */
   path: string;
   name: string;
   functions: ResourceFunction[];
@@ -33,5 +33,5 @@ export interface Resource {
 
 /** The fully qualified name used to look a resource up. */
 export function resourceKey(path: string, name: string): string {
-  return path === '' ? name : `${path}.${name}`;
+  return `${path}.${name}`;
 }

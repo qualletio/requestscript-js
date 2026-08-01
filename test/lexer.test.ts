@@ -125,7 +125,11 @@ describe('lexer', () => {
     expect(() => tokenize('"${}"')).toThrow(LexError);
   });
 
+  it('tokenizes the version marker', () => {
+    expect(tokenize('C@2').map((token) => token.type)).toEqual(['identifier', '@', 'int', 'eof']);
+  });
+
   it('rejects unexpected characters', () => {
-    expect(() => tokenize('@')).toThrow(LexError);
+    expect(() => tokenize('#')).toThrow(LexError);
   });
 });

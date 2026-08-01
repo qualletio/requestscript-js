@@ -28,6 +28,8 @@ export interface ContractDecl {
   /** Dotted path segments preceding the name; empty for a path-less contract. */
   path: string[];
   name: string;
+  /** Declared with '@<version>' after the name — dot-separated numbers such as '2' or '1.2.3'; '1' when omitted. */
+  version: string;
   parameters: ParameterDecl[];
 }
 

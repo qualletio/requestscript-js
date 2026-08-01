@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { Decimal } from '../src/lang/decimal.js';
 import { RuntimeError } from '../src/lang/errors.js';
+import { createResourceResolver } from '../src/lang/interpreter.js';
 import type { Resource, ResourceFunctionCallParameter } from '../src/lang/resource.js';
 import { runBody } from './helpers.js';
 
@@ -30,13 +31,13 @@ describe('interpreter: resources', () => {
       const num1 = 2
       const num2 = 3
       return addResource.add(first: num1, second: num2)`;
-    expect(await runBody(body, { resources: [addResource] })).toBe(5);
+    expect(await runBody(body, { resourceResolver: createResourceResolver([addResource]) })).toBe(5);
   });
 
   it('accepts named arguments in any order', async () => {
     const body = `const r: path.to.AddResource
       return r.add(second: 3, first: 2)`;
-    expect(await runBody(body, { resources: [addResource] })).toBe(5);
+    expect(await runBody(body, { resourceResolver: createResourceResolver([addResource]) })).toBe(5);
   });
 
   it('rejects unknown resources', async () => {
@@ -47,11 +48,11 @@ describe('interpreter: resources', () => {
 
   it('rejects unknown functions', async () => {
     const body = 'const r: path.to.AddResource\nreturn r.subtract(first: 1, second: 2)';
-    await expect(runBody(body, { resources: [addResource] })).rejects.toThrow(/has no function 'subtract'/);
+    await expect(runBody(body, { resourceResolver: createResourceResolver([addResource]) })).rejects.toThrow(/has no function 'subtract'/);
   });
 
   it('rejects missing, unknown, and badly typed arguments', async () => {
-    const opts = { resources: [addResource] };
+    const opts = { resourceResolver: createResourceResolver([addResource]) };
     await expect(runBody('const r: path.to.AddResource\nreturn r.add(first: 1)', opts)).rejects.toThrow(
       /Missing argument 'second'/,
     );
@@ -69,7 +70,7 @@ describe('interpreter: resources', () => {
       name: 'Ping',
       functions: [{ name: 'ping', parameters: [], exec: () => 'pong', returnType: 'string' }],
     };
-    expect(await runBody('const p: Ping\nreturn p.ping()', { resources: [resource] })).toBe('pong');
+    expect(await runBody('const p: Ping\nreturn p.ping()', { resourceResolver: createResourceResolver([resource]) })).toBe('pong');
   });
 
   it('supports void functions and returns null for them', async () => {
@@ -88,7 +89,7 @@ describe('interpreter: resources', () => {
         },
       ],
     };
-    expect(await runBody('const l: Log\nreturn l.log(message: "hi")', { resources: [resource] })).toBeNull();
+    expect(await runBody('const l: Log\nreturn l.log(message: "hi")', { resourceResolver: createResourceResolver([resource]) })).toBeNull();
     expect(calls).toEqual([['hi']]);
   });
 
@@ -108,7 +109,7 @@ describe('interpreter: resources', () => {
         },
       ],
     };
-    expect(await runBody('const a: Async\nreturn a.get()', { resources: [resource] })).toBe(42);
+    expect(await runBody('const a: Async\nreturn a.get()', { resourceResolver: createResourceResolver([resource]) })).toBe(42);
   });
 
   it('converts values in both directions, including int64, decimal, lists, and objects', async () => {
@@ -139,7 +140,7 @@ describe('interpreter: resources', () => {
     };
     const body = `const e: Echo
       return e.echo(big: 9223372036854775807, price: 19.99, tags: ["a", "b"], meta: { ok: true })`;
-    const result = await runBody(body, { resources: [resource] });
+    const result = await runBody(body, { resourceResolver: createResourceResolver([resource]) });
     expect(seen['big']).toBe(9223372036854775807n);
     expect(seen['price']).toBeInstanceOf(Decimal);
     expect((seen['price'] as Decimal).toString()).toBe('19.99');
@@ -154,7 +155,7 @@ describe('interpreter: resources', () => {
       name: 'Bad',
       functions: [{ name: 'get', parameters: [], exec: () => 'not a number', returnType: 'int32' }],
     };
-    await expect(runBody('const b: Bad\nreturn b.get()', { resources: [resource] })).rejects.toThrow(RuntimeError);
+    await expect(runBody('const b: Bad\nreturn b.get()', { resourceResolver: createResourceResolver([resource]) })).rejects.toThrow(RuntimeError);
   });
 
   it('wraps host errors as runtime errors', async () => {
@@ -172,22 +173,22 @@ describe('interpreter: resources', () => {
         },
       ],
     };
-    await expect(runBody('const b: Boom\nreturn b.explode()', { resources: [resource] })).rejects.toThrow(
+    await expect(runBody('const b: Boom\nreturn b.explode()', { resourceResolver: createResourceResolver([resource]) })).rejects.toThrow(
       /Resource function 'explode' failed: kaboom/,
     );
   });
 
   it('rejects calling functions on non-resources and referencing functions without calling', async () => {
-    await expect(runBody('var o = { a: 1 }\nreturn o.a(x: 1)', { resources: [addResource] })).rejects.toThrow(
+    await expect(runBody('var o = { a: 1 }\nreturn o.a(x: 1)', { resourceResolver: createResourceResolver([addResource]) })).rejects.toThrow(
       /Cannot call 'a'/,
     );
-    await expect(runBody('const r: path.to.AddResource\nreturn r.add', { resources: [addResource] })).rejects.toThrow(
+    await expect(runBody('const r: path.to.AddResource\nreturn r.add', { resourceResolver: createResourceResolver([addResource]) })).rejects.toThrow(
       /must be called/,
     );
   });
 
   it('rejects using a resource reference as a value', async () => {
-    const opts = { resources: [addResource] };
+    const opts = { resourceResolver: createResourceResolver([addResource]) };
     await expect(runBody('const r: path.to.AddResource\nreturn r', opts)).rejects.toThrow(
       /cannot be used as a value/,
     );

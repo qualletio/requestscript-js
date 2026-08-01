@@ -16,6 +16,7 @@ describe('parser: declarations', () => {
     expect(declaration.kind).toBe('contract');
     expect(declaration.path).toEqual(['path', 'to', 'contract']);
     expect(declaration.name).toBe('MyContract');
+    expect(declaration.version).toBe('1');
     expect(declaration.parameters).toEqual([{ name: 'param1', type: { kind: 'string' } }]);
   });
 
@@ -24,6 +25,39 @@ describe('parser: declarations', () => {
     const declaration = script.declaration as ContractDecl;
     expect(declaration.path).toEqual([]);
     expect(declaration.parameters).toEqual([]);
+  });
+
+  it('parses a declared contract version', () => {
+    const script = parseScript('contract path.to.MyContract@3(param1: string) { }');
+    const declaration = script.declaration as ContractDecl;
+    expect(declaration.name).toBe('MyContract');
+    expect(declaration.version).toBe('3');
+    expect(declaration.parameters).toEqual([{ name: 'param1', type: { kind: 'string' } }]);
+  });
+
+  it('parses a version on a parameterless contract', () => {
+    const script = parseScript('contract C@12 { }');
+    expect((script.declaration as ContractDecl).version).toBe('12');
+  });
+
+  it('parses decimal and semantic versions', () => {
+    const version = (source: string) => (parseScript(source).declaration as ContractDecl).version;
+    expect(version('contract C@1.5 { }')).toBe('1.5');
+    expect(version('contract C@1.2.3 { }')).toBe('1.2.3');
+    expect(version('contract C@0.1.0 { }')).toBe('0.1.0');
+    expect(version('contract C@10.20.30.40 { }')).toBe('10.20.30.40');
+    expect(version('contract a.b.C@2.0(p: string) { }')).toBe('2.0');
+  });
+
+  it('rejects invalid contract versions', () => {
+    expect(() => parseScript('contract C@ { }')).toThrow(ParseError);
+    expect(() => parseScript('contract C@v2 { }')).toThrow(ParseError);
+    expect(() => parseScript('contract C@1. { }')).toThrow(ParseError);
+    expect(() => parseScript('contract C@1..2 { }')).toThrow(ParseError);
+    expect(() => parseScript('contract C@1.x { }')).toThrow(ParseError);
+    expect(() => parseScript('contract C@1 .2 { }')).toThrow(ParseError);
+    expect(() => parseScript('contract C@1. 2 { }')).toThrow(ParseError);
+    expect(() => parseScript('request R@1 { }')).toThrow(ParseError);
   });
 
   it('parses list and decimal parameter types with trailing commas', () => {

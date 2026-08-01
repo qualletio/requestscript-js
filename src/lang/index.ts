@@ -3,11 +3,14 @@ export { Decimal, DecimalArithmeticError } from './decimal.js';
 export { LexError, ParameterError, ParseError, RequestScriptError, RuntimeError } from './errors.js';
 export {
   Interpreter,
+  createResourceResolver,
+  defaultResourceResolver,
   interpret,
   interpretParsed,
   valuesEqual,
   type InterpretOptions,
   type InterpretResult,
+  type ResourceResolver,
 } from './interpreter.js';
 export { tokenize } from './lexer.js';
 export { Parser, parseScript, parseTypeString } from './parser.js';

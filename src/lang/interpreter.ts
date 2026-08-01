@@ -39,9 +39,30 @@ import {
   type Value,
 } from './values.js';
 
+export interface ResourceResolver {
+  resources: Map<string, Resource>;
+  resolve(key: string): Resource | undefined;
+}
+
+export const defaultResourceResolver: ResourceResolver = {
+  resources: new Map<string, Resource>(),
+  resolve(key: string): Resource | undefined {
+    return this.resources.get(key);
+  },
+};
+
+/** A resolver over a fixed list of resources. */
+export function createResourceResolver(resources: Resource[]): ResourceResolver {
+  const map = new Map(resources.map((resource) => [resourceKey(resource.path, resource.name), resource]));
+  return {
+    resources: map,
+    resolve: (key) => map.get(key),
+  };
+}
+
 export interface InterpretOptions {
   /** Host resources scripts may reference. */
-  resources?: Resource[];
+  resourceResolver?: ResourceResolver;
   /** Contract parameter values (as parsed JSON). */
   parameters?: Record<string, unknown>;
 }
@@ -88,13 +109,7 @@ function requireData(value: Value, line: number): Value {
 }
 
 export class Interpreter {
-  private readonly resources = new Map<string, Resource>();
-
-  constructor(resources: Resource[] = []) {
-    for (const resource of resources) {
-      this.resources.set(resourceKey(resource.path, resource.name), resource);
-    }
-  }
+  constructor(private readonly resourceResolver: ResourceResolver) {}
 
   async run(script: Script, parameters?: Record<string, unknown>): Promise<InterpretResult> {
     const root = new Environment();
@@ -162,7 +177,7 @@ export class Interpreter {
       case 'resourceDecl': {
         const path = statement.resourcePath.join('.');
         const key = resourceKey(path, statement.resourceName);
-        const resource = this.resources.get(key);
+        const resource = this.resourceResolver.resolve(key);
         if (!resource) {
           throw new RuntimeError(`Unknown resource '${key}'`, statement.line);
         }
@@ -620,6 +635,6 @@ export async function interpret(source: string, options: InterpretOptions = {}):
 
 /** Executes an already-parsed script. */
 export async function interpretParsed(script: Script, options: InterpretOptions = {}): Promise<InterpretResult> {
-  const interpreter = new Interpreter(options.resources ?? []);
+  const interpreter = new Interpreter(options.resourceResolver ?? defaultResourceResolver);
   return interpreter.run(script, options.parameters);
 }
