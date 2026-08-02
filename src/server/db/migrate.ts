@@ -14,7 +14,7 @@ export const MIGRATIONS_FOLDER = fileURLToPath(new URL('../../../drizzle', impor
 export async function runMigrations(connectionString: string = databaseUrl()): Promise<void> {
   const pool = new pg.Pool({ connectionString });
   try {
-    await migrate(drizzle(pool), { migrationsFolder: MIGRATIONS_FOLDER });
+    await migrate(drizzle({client: pool}), { migrationsFolder: MIGRATIONS_FOLDER });
   } finally {
     await pool.end();
   }

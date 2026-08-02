@@ -19,7 +19,7 @@ const addResource: Resource = {
         { name: 'first', type: 'int32' },
         { name: 'second', type: 'int32' },
       ],
-      exec: (args) =>
+      exec: async (args) =>
         Number(args.find((parameter) => parameter.name === 'first')?.value) +
         Number(args.find((parameter) => parameter.name === 'second')?.value),
       returnType: 'int32',

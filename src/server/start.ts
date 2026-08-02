@@ -2,7 +2,7 @@ import { drizzle } from 'drizzle-orm/node-postgres';
 import type { Express, RequestHandler } from 'express';
 import type { Server } from 'node:http';
 import pg from 'pg';
-import { defaultResourceResolver, type ResourceResolver } from '../lang/interpreter.js';
+import { DefaultResourceResolver, type ResourceResolver } from '../lang/interpreter.js';
 import { createApp } from './app.js';
 import { databaseUrl, schema } from './db/index.js';
 import { runMigrations } from './db/migrate.js';
@@ -41,10 +41,10 @@ export async function startServer(options: StartServerOptions = {}): Promise<Run
   }
 
   const pool = new pg.Pool({ connectionString });
-  const db = drizzle(pool, { schema });
+  const db = drizzle({client: pool});
   const app = createApp({
     db,
-    resourceResolver: options.resourceResolver ?? defaultResourceResolver,
+    resourceResolver: options.resourceResolver ?? new DefaultResourceResolver(new Map()),
     middleware: options.middleware ?? [],
   });
 

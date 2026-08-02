@@ -17,11 +17,10 @@ import {
   hostToValue,
   inferType,
   parameterToValue,
-  typeToString,
   valueToHost,
   valueToJson,
   valueTypeName,
-  type RuntimeType,
+  type RuntimeType
 } from './types.js';
 import {
   INT32_MAX,
@@ -40,29 +39,46 @@ import {
 } from './values.js';
 
 export interface ResourceResolver {
-  resources: Map<string, Resource>;
-  resolve(key: string): Resource | undefined;
+  resolve(key: string): Promise<Resource | undefined>;
 }
 
-export const defaultResourceResolver: ResourceResolver = {
-  resources: new Map<string, Resource>(),
-  resolve(key: string): Resource | undefined {
+export class DefaultResourceResolver implements ResourceResolver {
+  constructor(private readonly resources: Map<string, Resource>) {}
+
+  async resolve(key: string): Promise<Resource | undefined> {
     return this.resources.get(key);
-  },
-};
+  }
+}
 
 /** A resolver over a fixed list of resources. */
 export function createResourceResolver(resources: Resource[]): ResourceResolver {
   const map = new Map(resources.map((resource) => [resourceKey(resource.path, resource.name), resource]));
   return {
-    resources: map,
-    resolve: (key) => map.get(key),
+    resolve: async (key) => map.get(key) ?? undefined,
   };
 }
+
+export interface ResourceInvoker {
+  invoke(resource: Resource, functionName: string, parameters: ResourceFunctionCallParameter[]): Promise<unknown>;
+}
+
+export const defaultResourceInvoker: ResourceInvoker = {
+  async invoke(resource, functionName, parameters) {
+    const fn = resource.functions.find((candidate) => candidate.name === functionName);
+    if (!fn) {
+      throw new RuntimeError(
+        `Resource '${resourceKey(resource.path, resource.name)}' has no function '${functionName}'`,
+      );
+    }
+    return fn.exec(parameters);
+  },
+};
 
 export interface InterpretOptions {
   /** Host resources scripts may reference. */
   resourceResolver?: ResourceResolver;
+  /** Resource invoker to use for resource function calls. */
+  resourceInvoker?: ResourceInvoker;
   /** Contract parameter values (as parsed JSON). */
   parameters?: Record<string, unknown>;
 }
@@ -109,7 +125,7 @@ function requireData(value: Value, line: number): Value {
 }
 
 export class Interpreter {
-  constructor(private readonly resourceResolver: ResourceResolver) {}
+  constructor(private readonly resourceResolver: ResourceResolver, private readonly resourceInvoker: ResourceInvoker) {}
 
   async run(script: Script, parameters?: Record<string, unknown>): Promise<InterpretResult> {
     const root = new Environment();
@@ -177,7 +193,7 @@ export class Interpreter {
       case 'resourceDecl': {
         const path = statement.resourcePath.join('.');
         const key = resourceKey(path, statement.resourceName);
-        const resource = this.resourceResolver.resolve(key);
+        const resource = await this.resourceResolver.resolve(key);
         if (!resource) {
           throw new RuntimeError(`Unknown resource '${key}'`, statement.line);
         }
@@ -412,7 +428,7 @@ export class Interpreter {
 
     let result: unknown;
     try {
-      result = await fn.exec(callParameters);
+      result = await this.resourceInvoker.invoke(resource, fn.name, callParameters);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       throw new RuntimeError(`Resource function '${fn.name}' failed: ${message}`, expression.line);
@@ -635,6 +651,6 @@ export async function interpret(source: string, options: InterpretOptions = {}):
 
 /** Executes an already-parsed script. */
 export async function interpretParsed(script: Script, options: InterpretOptions = {}): Promise<InterpretResult> {
-  const interpreter = new Interpreter(options.resourceResolver ?? defaultResourceResolver);
+  const interpreter = new Interpreter(options.resourceResolver ?? new DefaultResourceResolver(new Map()), options.resourceInvoker ?? defaultResourceInvoker);
   return interpreter.run(script, options.parameters);
 }

@@ -1,7 +1,11 @@
 import { describe, expect, it } from 'vitest';
 import { Decimal } from '../src/lang/decimal.js';
 import { RuntimeError } from '../src/lang/errors.js';
-import { createResourceResolver } from '../src/lang/interpreter.js';
+import {
+  createResourceResolver,
+  defaultResourceInvoker,
+  type ResourceInvoker,
+} from '../src/lang/interpreter.js';
 import type { Resource, ResourceFunctionCallParameter } from '../src/lang/resource.js';
 import { runBody } from './helpers.js';
 
@@ -19,7 +23,7 @@ const addResource: Resource = {
         { name: 'first', type: 'int32' },
         { name: 'second', type: 'int32' },
       ],
-      exec: (args) => Number(arg(args, 'first')) + Number(arg(args, 'second')),
+      exec: async (args) => Number(arg(args, 'first')) + Number(arg(args, 'second')),
       returnType: 'int32',
     },
   ],
@@ -68,7 +72,7 @@ describe('interpreter: resources', () => {
     const resource: Resource = {
       path: '',
       name: 'Ping',
-      functions: [{ name: 'ping', parameters: [], exec: () => 'pong', returnType: 'string' }],
+      functions: [{ name: 'ping', parameters: [], exec: async () => 'pong', returnType: 'string' }],
     };
     expect(await runBody('const p: Ping\nreturn p.ping()', { resourceResolver: createResourceResolver([resource]) })).toBe('pong');
   });
@@ -82,7 +86,7 @@ describe('interpreter: resources', () => {
         {
           name: 'log',
           parameters: [{ name: 'message', type: 'string' }],
-          exec: (args) => {
+          exec: async (args) => {
             calls.push(args.map((parameter) => parameter.value));
           },
           returnType: 'void',
@@ -126,7 +130,7 @@ describe('interpreter: resources', () => {
             { name: 'tags', type: '[]string' },
             { name: 'meta', type: 'object' },
           ],
-          exec: (args) => {
+          exec: async (args) => {
             for (const parameter of args) seen[parameter.name] = parameter.value;
             return {
               big: arg(args, 'big'),
@@ -153,7 +157,7 @@ describe('interpreter: resources', () => {
     const resource: Resource = {
       path: '',
       name: 'Bad',
-      functions: [{ name: 'get', parameters: [], exec: () => 'not a number', returnType: 'int32' }],
+      functions: [{ name: 'get', parameters: [], exec: async () => 'not a number', returnType: 'int32' }],
     };
     await expect(runBody('const b: Bad\nreturn b.get()', { resourceResolver: createResourceResolver([resource]) })).rejects.toThrow(RuntimeError);
   });
@@ -166,7 +170,7 @@ describe('interpreter: resources', () => {
         {
           name: 'explode',
           parameters: [],
-          exec: () => {
+          exec: async () => {
             throw new Error('kaboom');
           },
           returnType: 'void',
@@ -194,5 +198,77 @@ describe('interpreter: resources', () => {
     );
     await expect(runBody('const r: path.to.AddResource\nvar x = r', opts)).rejects.toThrow(RuntimeError);
     await expect(runBody('const r: path.to.AddResource\nreturn [r]', opts)).rejects.toThrow(RuntimeError);
+  });
+});
+
+describe('interpreter: resource invoker', () => {
+  const body = `const r: path.to.AddResource
+    return r.add(first: 2, second: 3)`;
+
+  it('routes calls through a custom invoker instead of exec', async () => {
+    const calls: { resource: Resource; functionName: string; parameters: ResourceFunctionCallParameter[] }[] = [];
+    const invoker: ResourceInvoker = {
+      async invoke(resource, functionName, parameters) {
+        calls.push({ resource, functionName, parameters });
+        return 99;
+      },
+    };
+    const opts = { resourceResolver: createResourceResolver([addResource]), resourceInvoker: invoker };
+    expect(await runBody(body, opts)).toBe(99);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.resource).toBe(addResource);
+    expect(calls[0]!.functionName).toBe('add');
+    expect(calls[0]!.parameters).toEqual([
+      { name: 'first', value: 2 },
+      { name: 'second', value: 3 },
+    ]);
+  });
+
+  it('validates the custom invoker result against the declared return type', async () => {
+    const invoker: ResourceInvoker = { invoke: async () => 'not a number' };
+    const opts = { resourceResolver: createResourceResolver([addResource]), resourceInvoker: invoker };
+    await expect(runBody(body, opts)).rejects.toThrow(RuntimeError);
+  });
+
+  it('wraps custom invoker errors as runtime errors', async () => {
+    const invoker: ResourceInvoker = {
+      invoke: async () => {
+        throw new Error('unreachable host');
+      },
+    };
+    const opts = { resourceResolver: createResourceResolver([addResource]), resourceInvoker: invoker };
+    await expect(runBody(body, opts)).rejects.toThrow(/Resource function 'add' failed: unreachable host/);
+  });
+
+  it('validates the function and arguments before calling the invoker', async () => {
+    const calls: string[] = [];
+    const invoker: ResourceInvoker = {
+      invoke: async (_resource, functionName) => {
+        calls.push(functionName);
+        return 0;
+      },
+    };
+    const opts = { resourceResolver: createResourceResolver([addResource]), resourceInvoker: invoker };
+    await expect(runBody('const r: path.to.AddResource\nreturn r.subtract(first: 1, second: 2)', opts)).rejects.toThrow(
+      /has no function 'subtract'/,
+    );
+    await expect(runBody('const r: path.to.AddResource\nreturn r.add(first: 1)', opts)).rejects.toThrow(
+      /Missing argument 'second'/,
+    );
+    expect(calls).toEqual([]);
+  });
+
+  it('defaultResourceInvoker executes the resource function', async () => {
+    const result = await defaultResourceInvoker.invoke(addResource, 'add', [
+      { name: 'first', value: 2 },
+      { name: 'second', value: 3 },
+    ]);
+    expect(result).toBe(5);
+  });
+
+  it('defaultResourceInvoker rejects unknown functions', async () => {
+    await expect(defaultResourceInvoker.invoke(addResource, 'subtract', [])).rejects.toThrow(
+      /Resource 'path.to.AddResource' has no function 'subtract'/,
+    );
   });
 });

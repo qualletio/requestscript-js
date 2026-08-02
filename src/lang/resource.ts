@@ -19,12 +19,13 @@ export interface ResourceFunctionCallParameter {
 export interface ResourceFunction {
   name: string;
   parameters: ResourceFunctionParameter[];
-  exec: (args: ResourceFunctionCallParameter[]) => unknown;
+  exec: (args: ResourceFunctionCallParameter[]) => Promise<unknown>;
   /** A Requestscript type string, or 'void' when nothing is returned. */
   returnType: string;
 }
 
 export interface Resource {
+  metadata: Record<string, unknown>;
   /** Dotted path such as 'path.to'. */
   path: string;
   name: string;

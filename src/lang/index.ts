@@ -4,13 +4,15 @@ export { LexError, ParameterError, ParseError, RequestScriptError, RuntimeError 
 export {
   Interpreter,
   createResourceResolver,
-  defaultResourceResolver,
+  DefaultResourceResolver,
   interpret,
   interpretParsed,
   valuesEqual,
   type InterpretOptions,
   type InterpretResult,
   type ResourceResolver,
+  type ResourceInvoker,
+  defaultResourceInvoker,
 } from './interpreter.js';
 export { tokenize } from './lexer.js';
 export { Parser, parseScript, parseTypeString } from './parser.js';
