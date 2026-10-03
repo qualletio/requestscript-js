@@ -1,9 +1,10 @@
 # Requestscript
 
-Welcome to Requestscript! Requestscript is a portable programming language and interpreter. Requestscript's syntax is based on Typescript and Kotlin.
+Welcome to RequestScript! RequestScript is a portable programming language and interpreter. Requestscript's syntax is based on Typescript and Kotlin.
 
 RequestScript is mostly intended to run in the body of an http request to a RequestScript server like so:
 POST /run
+
 ```
 request MyRequest {
     return "Hello World!"
@@ -11,11 +12,14 @@ request MyRequest {
 ```
 
 The following is the basics of the language and how it should function.
+
 ## Request declaration
-A RequestScript script starts with the request declaration. 
+
+A RequestScript script starts with the request declaration.
 This declaration is where the "meta" of a request is declared. The request's name, type, and parameters.
 
 ### Request type
+
 A Request request type is a one-off request sent to the server. It does not have parameters.
 It looks like so:
 
@@ -30,6 +34,7 @@ A comment is a line of the script that is ignored and used to help the user. Sta
 The declaration always goes "type" "name" "optional parameters".
 
 ### Contract type
+
 A Contract request type is a rerunnable script that is saved to the server and ran on command. Contracts can have parameters:
 
 ```
@@ -41,6 +46,7 @@ contract path.to.contract.MyContract(param1: string) {
 The contract name is preceded by its path. Two contracts can have the same name, but only one contract can exist at a path with that name.
 
 If a contract does not have parameters, the parentheses are excluded:
+
 ```
 contract MyParameterlessContract {
     // Script body goes here
@@ -58,6 +64,7 @@ Example:
 
 url: /run/path/to/MyContract
 body:
+
 ```json
 {
     "parameters": {
@@ -72,6 +79,7 @@ RequestScript supports a number of built in types. These are the following:
 `int32`, `int64`, `decimal`, `boolean`, `string`, `object`, or square brackets followed by a type to indicate a list: `[]int32`.
 
 ### Decimals
+
 Decimals are declared with the number of places before and after the decimal point:
 
 ```
@@ -81,9 +89,11 @@ request MyRequest {
 ```
 
 ### Booleans
-Booleans are declared with either the value `true` or `false`
+
+Booleans are declared with either the value `true` or `false`.
 
 ### Strings
+
 Strings are declared inside quote marks:
 
 ```
@@ -162,7 +172,8 @@ request MyRequest {
 ```
 
 ## Variables
-Variables store data. 
+
+Variables store data.
 
 The `var` keyword declares a mutable variable. After the `var` keyword, declare the variable name, then colon, type, then value. The type may be omitted and will be inferred from the value.
 
@@ -173,6 +184,7 @@ request MyRequest {
 ```
 
 Omitting the type:
+
 ```
 request MyRequest {
     var myVar = "test"
@@ -182,6 +194,7 @@ request MyRequest {
 Variables cannot change type. Once a variable is declared, it cannot be redeclared with the `var` keyword or the `const` keyword.
 
 ### Const variables
+
 The `const` keyword is used to declare a variable that cannot change:
 
 ```
@@ -189,11 +202,13 @@ request MyRequest {
     const myVar = "Test"
 }
 ```
+
 All the features of a var variable apply to a const variable.
 
 ## Return Statement
 
 The return statement is used to return a value from the script execution and immediately stop execution:
+
 ```
 request MyRequest {
     return "Test"
@@ -201,6 +216,7 @@ request MyRequest {
 ```
 
 A return statement can be a raw value (like a string) or a variable:
+
 ```
 request MyRequest {
     var myVar = 123
@@ -212,9 +228,10 @@ request MyRequest {
 Any expressions after a return are skipped and ignored.
 
 On an http response, the return value is encoded to JSON with the `returnValue` key:
+
 ```json
 {
-    "returnValue": 123
+  "returnValue": 123
 }
 ```
 
@@ -225,7 +242,8 @@ If a script has no return statement, then `returnValue` is `null`.
 ## Control Statements
 
 ## If Statement
-An if statement determines whether the code within it executes. 
+
+An if statement determines whether the code within it executes.
 An if statement starts with the `if` keyword, then a boolean expression condition in parentheses, then a block of code to execute if the statement passes within curly braces.
 
 ```
@@ -275,10 +293,11 @@ request MyRequest {
 ```
 
 ## Resources
-Resources act as a way to execute actions in the host language. 
+
+Resources act as a way to execute actions in the host language.
 The host language in this case, being Typescript.
 
-Resources are declared in Typescript and passed into the Requestscript interpreter. 
+Resources are declared in Typescript and passed into the Requestscript interpreter.
 The interpreter can then call the functions declared of resources when they are referenced in Requestscript.
 
 For example:
@@ -339,7 +358,7 @@ Can be executed from Requestscript with the following syntax:
 request MyRequest {
     // First we declare the reference to the resource
     const addResource: path.to.AddResource
-    
+
     const num1 = 2
     const num2 = 3
 
@@ -352,7 +371,8 @@ The interpreter should find the resource at the path with that name and call thi
 
 ## Server
 
-The server in typescript should be express based. Contracts are stored on the server Postgres and accessed by the interpreter engine using the drizzle library. The shape of the contract table is managed with database migrations.
+Contracts are stored on the server and accessed by the interpreter engine using the drizzle library. The shape of the contract table is managed with database migrations.
 
 ## Tests
+
 There should be comprehensive test coverage for the full behavior of the Requestscript language and interpreter.
