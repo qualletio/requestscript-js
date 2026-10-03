@@ -2,12 +2,14 @@
 
 A Typescript implementation of RequestScript — the language, interpreter, and HTTP server, packaged as an npm library. The language was originally specified in [intro-guide.md](./intro-guide.md); this README documents how to use the package and gives a full [language reference](#the-language), including the decisions made where the guide left room.
 
+Join the [Discord](https://discord.gg/79agn5yPc) to coordinate your contributions with the Quallet team
+
 ## Using as a library
 
 The root export is the language itself — no server, database, or Express involved:
 
 ```ts
-import { interpret } from 'requestscript-js';
+import { interpret } from "requestscript-js";
 
 const result = await interpret(source, { resources, parameters });
 console.log(result.returnValue);
@@ -18,8 +20,8 @@ Everything needed to build on the language is exported: `tokenize`, `parseScript
 The HTTP server lives behind the `requestscript-js/server` subpath:
 
 ```ts
-import { createResourceResolver } from 'requestscript-js';
-import { startServer, createApp, runMigrations } from 'requestscript-js/server';
+import { createResourceResolver } from "requestscript-js";
+import { startServer, createApp, runMigrations } from "requestscript-js/server";
 
 // Batteries included: connects, migrates, and listens.
 const running = await startServer({
@@ -54,15 +56,15 @@ Configuration is via environment variables: `DATABASE_URL` (defaults to `postgre
 
 ## HTTP API
 
-| Method & path | Body | Purpose |
-| --- | --- | --- |
-| `POST /run` | script text | Execute a `request` script once; responds `{ "returnValue": ... }` |
-| `POST /contracts` | script text | Create a `contract` script (`201`); `409` if that version already exists |
-| `POST /run/<path>/<Name>` | `{ "parameters": { ... } }` | Invoke the latest version of a saved contract (omit the body when parameterless) |
-| `POST /run/<path>/<Name>@<n>` | `{ "parameters": { ... } }` | Invoke a specific version of a saved contract |
-| `GET /contracts` | — | List every saved contract version and its parameters |
-| `DELETE /contracts/<path>/<Name>` | — | Delete every version of a contract |
-| `DELETE /contracts/<path>/<Name>@<n>` | — | Delete one version of a contract |
+| Method & path                         | Body                        | Purpose                                                                          |
+| ------------------------------------- | --------------------------- | -------------------------------------------------------------------------------- |
+| `POST /run`                           | script text                 | Execute a `request` script once; responds `{ "returnValue": ... }`               |
+| `POST /contracts`                     | script text                 | Create a `contract` script (`201`); `409` if that version already exists         |
+| `POST /run/<path>/<Name>`             | `{ "parameters": { ... } }` | Invoke the latest version of a saved contract (omit the body when parameterless) |
+| `POST /run/<path>/<Name>@<n>`         | `{ "parameters": { ... } }` | Invoke a specific version of a saved contract                                    |
+| `GET /contracts`                      | —                           | List every saved contract version and its parameters                             |
+| `DELETE /contracts/<path>/<Name>`     | —                           | Delete every version of a contract                                               |
+| `DELETE /contracts/<path>/<Name>@<n>` | —                           | Delete one version of a contract                                                 |
 
 Errors are returned as `{ "error": { "type", "message" } }`: lex/parse, parameter, and malformed-version errors are `400`, an already-existing contract version is `409`, script runtime errors are `422`, unknown contracts/routes are `404`.
 
@@ -130,16 +132,16 @@ contract path.to.MyContract@1.2.3(name: string, tags: []string,) {
 
 ### Types
 
-| Type | Values | Notes |
-| --- | --- | --- |
-| `int32` | 32-bit signed integers | Range-checked; never wraps. |
-| `int64` | 64-bit signed integers | Backed by `BigInt`; never wraps. |
-| `decimal` | Exact fixed-point decimals | `0.1 + 0.2 == 0.3` is `true`. |
+| Type            | Values                                                                 | Notes                                          |
+| --------------- | ---------------------------------------------------------------------- | ---------------------------------------------- |
+| `int32`         | 32-bit signed integers                                                 | Range-checked; never wraps.                    |
+| `int64`         | 64-bit signed integers                                                 | Backed by `BigInt`; never wraps.               |
+| `decimal`       | Exact fixed-point decimals                                             | `0.1 + 0.2 == 0.3` is `true`.                  |
 | `decimal(p, s)` | Decimals with at most `p` digits before and `s` digits after the point | Bounds are checked whenever a value is stored. |
-| `boolean` | `true`, `false` | |
-| `string` | Text | |
-| `object` | String-keyed maps of any values | Untyped; properties can hold any type. |
-| `[]T` | Lists of `T` | Nestable: `[][]int32`. |
+| `boolean`       | `true`, `false`                                                        |                                                |
+| `string`        | Text                                                                   |                                                |
+| `object`        | String-keyed maps of any values                                        | Untyped; properties can hold any type.         |
+| `[]T`           | Lists of `T`                                                           | Nestable: `[][]int32`.                         |
 
 `null` is a value of every type: it can be assigned to any variable, parameter, or list element.
 
@@ -182,15 +184,15 @@ Object keys are bare identifiers (quoted keys are not supported) and must be uni
 
 **Operators**, from lowest to highest precedence (all binary operators are left-associative):
 
-| Precedence | Operators | Operands |
-| --- | --- | --- |
-| 1 | `\|\|` | booleans; short-circuits |
-| 2 | `&&` | booleans; short-circuits |
-| 3 | `==` `!=` | any values |
-| 4 | `<` `<=` `>` `>=` | two numbers, or two strings |
-| 5 | `+` `-` | numbers; `+` also concatenates strings |
-| 6 | `*` `/` | numbers |
-| 7 | unary `!`, unary `-` | boolean, number |
+| Precedence | Operators            | Operands                               |
+| ---------- | -------------------- | -------------------------------------- |
+| 1          | `\|\|`               | booleans; short-circuits               |
+| 2          | `&&`                 | booleans; short-circuits               |
+| 3          | `==` `!=`            | any values                             |
+| 4          | `<` `<=` `>` `>=`    | two numbers, or two strings            |
+| 5          | `+` `-`              | numbers; `+` also concatenates strings |
+| 6          | `*` `/`              | numbers                                |
+| 7          | unary `!`, unary `-` | boolean, number                        |
 
 Parentheses group as usual. Operator semantics:
 
@@ -239,23 +241,23 @@ request MyRequest {
 On the host side, a resource is a plain object:
 
 ```ts
-import type { Resource } from 'requestscript-js';
+import type { Resource } from "requestscript-js";
 
 const addResource: Resource = {
   metadata: {},
-  path: 'path.to',
-  name: 'AddResource',
+  path: "path.to",
+  name: "AddResource",
   functions: [
     {
-      name: 'add',
+      name: "add",
       parameters: [
-        { name: 'first', type: 'int32' },
-        { name: 'second', type: 'int32' },
+        { name: "first", type: "int32" },
+        { name: "second", type: "int32" },
       ],
-      returnType: 'int32', // any RequestScript type string, or 'void'
+      returnType: "int32", // any RequestScript type string, or 'void'
       exec: async (args) => {
-        const first = args.find((a) => a.name === 'first')!.value as number;
-        const second = args.find((a) => a.name === 'second')!.value as number;
+        const first = args.find((a) => a.name === "first")!.value as number;
+        const second = args.find((a) => a.name === "second")!.value as number;
         return first + second;
       },
     },
