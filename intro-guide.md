@@ -363,11 +363,56 @@ request MyRequest {
     const num2 = 3
 
     // Now we can reference functions of the resource
-    return addResource.add(first: num1, second: num2)
+    const sum = addResource.add(first: num1, second: num2)
+
+    return sum.value
 }
 ```
 
-The interpreter should find the resource at the path with that name and call this function passing the values from the Requestscript variables. The return of the function (if it is not void) should be passed back into Requestscript.
+The interpreter should find the resource at the path with that name and call this function passing the values from the Requestscript variables.
+
+### Results
+
+Calling a resource function does not hand the return value straight back. The call produces a result object holding the return value in a `value` field, alongside an `error` field:
+
+```
+{
+    value: 5,
+    error: null,
+}
+```
+
+When the call fails, `value` is `null` and `error` is an object with a `message` string:
+
+```
+{
+    value: null,
+    error: {
+        message: "Example Message",
+    },
+}
+```
+
+A `void` function has no return value, so it produces `{ value: null, error: null }`.
+
+This is what lets a script handle a failing resource itself instead of the whole request failing:
+
+```
+request MyRequest {
+
+    const weather: com.example.Weather
+
+    const temperature = weather.temperature(city: "Oslo")
+
+    if (temperature.error != null) {
+        return temperature.error.message
+    }
+
+    return temperature.value
+}
+```
+
+The `exec` function in Typescript still returns the value on its own — it either returns the value or throws, and the interpreter builds the result object around it, turning a thrown error's message into `error.message`.
 
 ## Server
 

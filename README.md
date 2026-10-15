@@ -234,7 +234,31 @@ Resources expose host (Typescript) functions to scripts. A script binds one with
 ```
 request MyRequest {
     const math: path.to.AddResource
-    return math.add(first: 2, second: 3)
+    const sum = math.add(first: 2, second: 3)
+    return sum.value
+}
+```
+
+A call never evaluates to the bare return value. It always evaluates to a result object with exactly two properties — `value` and `error` — so a failing call is something the script can handle rather than something that ends it:
+
+```
+{ value: 5, error: null }                        // success
+{ value: null, error: { message: "timed out" } } // failure
+```
+
+`error` is `null` on success, and on failure it is an object with a single `message` string. A result carries one or the other, never both, so a script checks `error` first:
+
+```
+request MyRequest {
+    const weather: com.example.Weather
+
+    const temperature = weather.temperature(city: "Oslo")
+
+    if (temperature.error != null) {
+        return temperature.error.message
+    }
+
+    return temperature.value
 }
 ```
 
@@ -269,9 +293,31 @@ const addResource: Resource = {
 - A resource reference is not a value: it cannot be returned, stored in an object or list, interpolated, or read with `ref.fn` without a call.
 - Every declared parameter must be passed, and unknown or duplicate argument names are errors. Arguments are checked and promoted against the declared parameter types.
 - Arguments are passed to `exec` as host values: `int32` as `number`, `int64` as `bigint`, `decimal` as the exported `Decimal` class, `null` as `null`, and lists and objects as plain arrays and objects.
-- `exec` may be async. With `returnType: 'void'` the call evaluates to `null`; otherwise the returned value is converted to and validated against the declared return type. If `exec` throws, the script fails with a runtime error.
+- `exec` returns the value itself, not a result object — the wrapping happens for it. It may be async. The returned value is converted to and validated against the declared return type; with `returnType: 'void'` the call produces `{ value: null, error: null }`.
+- If `exec` throws, the thrown message becomes `error.message` and the script carries on. A type mismatch against `returnType` is still a `RuntimeError` that fails the script, because that is a bug in the host rather than a condition a script can act on.
 
 Pass resources to `interpret` with `resourceResolver: createResourceResolver([...])`, or to the server with the `resourceResolver` option of `startServer`/`createApp`.
+
+#### Custom invokers
+
+By default resources are run by `defaultResourceInvoker`, which calls `exec` and wraps the result. Pass `resourceInvoker` to `interpret` to run them some other way — over HTTP to another service, say. An invoker receives the resolved resource, the function name, and the coerced arguments, and returns the result object directly; the `resourceValue` and `resourceError` helpers build it:
+
+```ts
+import { resourceError, resourceValue, type ResourceInvoker } from "requestscript-js";
+
+const remoteInvoker: ResourceInvoker = {
+  async invoke(resource, functionName, parameters) {
+    const response = await fetch(url(resource, functionName), {
+      method: "POST",
+      body: JSON.stringify(parameters),
+    });
+    if (!response.ok) return resourceError(`${resource.name} returned ${response.status}`);
+    return resourceValue(await response.json());
+  },
+};
+```
+
+An invoker may also throw, which is treated exactly like a thrown `exec`. The function name and arguments are validated before the invoker is called, so `invoke` only ever sees a function the resource declares with every parameter present.
 
 ### JSON encoding
 
@@ -285,7 +331,9 @@ Interpreter failures are thrown as typed errors, which the server maps to HTTP s
 
 - `LexError` and `ParseError` (HTTP `400`) cover malformed source: unknown characters, unterminated strings, unknown types, duplicate keys or parameters, a missing declaration, and so on. They carry a line and column.
 - `ParameterError` (HTTP `400`) is raised for missing, unknown, or wrongly-typed contract parameters.
-- `RuntimeError` (HTTP `422`) covers everything detected while running: type mismatches, unknown variables, redeclaration, assigning to a `const`, overflow, division by zero, out-of-bounds indexes, non-boolean conditions, and resource failures. It carries a line number.
+- `RuntimeError` (HTTP `422`) covers everything detected while running: type mismatches, unknown variables, redeclaration, assigning to a `const`, overflow, division by zero, out-of-bounds indexes, and non-boolean conditions. It carries a line number.
+
+A resource function failing is not one of these. It is reported to the script as `error` on the call's result, and the request still succeeds — see [Resources](#resources).
 
 ## Project layout
 

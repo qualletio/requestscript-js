@@ -9,7 +9,13 @@ import type {
 import { Decimal, DecimalArithmeticError } from './decimal.js';
 import { ParameterError, RuntimeError } from './errors.js';
 import { parseScript, parseTypeString } from './parser.js';
-import { resourceKey, type Resource, type ResourceFunctionCallParameter } from './resource.js';
+import {
+  resourceKey,
+  resourceValue,
+  type Resource,
+  type ResourceFunctionCallParameter,
+  type ResourceResult,
+} from './resource.js';
 import {
   ANY_TYPE,
   coerce,
@@ -59,7 +65,16 @@ export function createResourceResolver(resources: Resource[]): ResourceResolver 
 }
 
 export interface ResourceInvoker {
-  invoke(resource: Resource, functionName: string, parameters: ResourceFunctionCallParameter[]): Promise<unknown>;
+  /**
+   * Runs a resource function. Returning `{ value, error }` lets the script
+   * handle the failure; throwing is also fine and is turned into the same
+   * shape with the thrown message.
+   */
+  invoke(
+    resource: Resource,
+    functionName: string,
+    parameters: ResourceFunctionCallParameter[],
+  ): Promise<ResourceResult>;
 }
 
 export const defaultResourceInvoker: ResourceInvoker = {
@@ -70,7 +85,7 @@ export const defaultResourceInvoker: ResourceInvoker = {
         `Resource '${resourceKey(resource.path, resource.name)}' has no function '${functionName}'`,
       );
     }
-    return fn.exec(parameters);
+    return resourceValue(await fn.exec(parameters));
   },
 };
 
@@ -122,6 +137,53 @@ function requireData(value: Value, line: number): Value {
     throw new RuntimeError('A resource reference cannot be used as a value', line);
   }
   return value;
+}
+
+/**
+ * Builds the `{ value, error }` object every resource call evaluates to.
+ * A result carries either a value or an error, never both.
+ */
+function resultValue(value: Value, errorMessage: string | null): Value {
+  const error =
+    errorMessage === null ? NULL_VALUE : objectValue(new Map([['message', stringValue(errorMessage)]]));
+  return objectValue(
+    new Map([
+      ['value', value],
+      ['error', error],
+    ]),
+  );
+}
+
+/** Checks that an invoker returned a well-formed result; a bad shape is a host bug, not a script error. */
+function toResourceResult(raw: unknown, functionName: string, line: number): ResourceResult {
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
+    throw new RuntimeError(
+      `Resource function '${functionName}' returned ${describeResult(raw)}, expected an object with 'value' and 'error'`,
+      line,
+    );
+  }
+  const record = raw as Record<string, unknown>;
+  if (!('value' in record) && !('error' in record)) {
+    throw new RuntimeError(
+      `Resource function '${functionName}' returned an object with neither 'value' nor 'error'`,
+      line,
+    );
+  }
+  const error = record['error'] ?? null;
+  if (error === null) return { value: record['value'] ?? null, error: null };
+  if (typeof error !== 'object' || Array.isArray(error) || typeof (error as Record<string, unknown>)['message'] !== 'string') {
+    throw new RuntimeError(
+      `Resource function '${functionName}' returned an error without a string 'message'`,
+      line,
+    );
+  }
+  return { value: null, error: { message: (error as { message: string }).message } };
+}
+
+function describeResult(raw: unknown): string {
+  if (raw === null) return 'null';
+  if (Array.isArray(raw)) return 'a list';
+  return `a ${typeof raw}`;
 }
 
 export class Interpreter {
@@ -426,17 +488,20 @@ export class Interpreter {
       callParameters.push({ name: parameter.name, value: valueToHost(coerced) });
     }
 
-    let result: unknown;
+    let raw: unknown;
     try {
-      result = await this.resourceInvoker.invoke(resource, fn.name, callParameters);
+      raw = await this.resourceInvoker.invoke(resource, fn.name, callParameters);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      throw new RuntimeError(`Resource function '${fn.name}' failed: ${message}`, expression.line);
+      return resultValue(NULL_VALUE, message);
     }
 
-    if (fn.returnType === 'void') return NULL_VALUE;
+    const result = toResourceResult(raw, fn.name, expression.line);
+    if (result.error !== null) return resultValue(NULL_VALUE, result.error.message);
+
+    if (fn.returnType === 'void') return resultValue(NULL_VALUE, null);
     const returnType = this.resourceType(fn.returnType, `return type of function '${fn.name}'`, expression.line);
-    return hostToValue(result, returnType, `returned from '${fn.name}'`);
+    return resultValue(hostToValue(result.value, returnType, `returned from '${fn.name}'`), null);
   }
 
   private resourceType(type: string, what: string, line: number): RuntimeType {
