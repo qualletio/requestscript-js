@@ -24,6 +24,14 @@ const addResource: Resource = {
         Number(args.find((parameter) => parameter.name === 'second')?.value),
       returnType: 'int32',
     },
+    {
+      name: 'fail',
+      parameters: [],
+      exec: async () => {
+        throw new Error('resource unavailable');
+      },
+      returnType: 'int32',
+    },
   ],
 };
 
@@ -66,10 +74,23 @@ describe('POST /run', () => {
   it('can call resources', async () => {
     const source = `request R {
       const addResource: path.to.AddResource
-      return addResource.add(first: 2, second: 3)
+      const sum = addResource.add(first: 2, second: 3)
+      return sum.value
     }`;
     const response = await postScript('/run', source);
     expect(response.body).toEqual({ returnValue: 5 });
+  });
+
+  it('reports a failed resource call as a 200 with the error in the result', async () => {
+    const source = `request R {
+      const addResource: path.to.AddResource
+      return addResource.fail()
+    }`;
+    const response = await postScript('/run', source);
+    expect(response.status).toBe(200);
+    expect(response.body).toEqual({
+      returnValue: { value: null, error: { message: 'resource unavailable' } },
+    });
   });
 
   it('rejects contract scripts', async () => {
@@ -191,7 +212,7 @@ describe('POST /run/<path>/<name>', () => {
   it('contracts can use resources', async () => {
     await postScript(
       '/contracts',
-      'contract math.Sum(a: int32, b: int32) {\nconst r: path.to.AddResource\nreturn r.add(first: a, second: b)\n}',
+      'contract math.Sum(a: int32, b: int32) {\nconst r: path.to.AddResource\nconst sum = r.add(first: a, second: b)\nreturn sum.value\n}',
     );
     const response = await request(app).post('/run/math/Sum').send({ parameters: { a: 20, b: 22 } });
     expect(response.body).toEqual({ returnValue: 42 });
