@@ -9,6 +9,7 @@ import type {
 import { Decimal, DecimalArithmeticError } from './decimal.js';
 import { ParameterError, RuntimeError } from './errors.js';
 import { TokenMeter } from './meter.js';
+import { KEYWORDS } from './token.js';
 import { parseScript, parseTypeString } from './parser.js';
 import {
   resourceKey,
@@ -37,6 +38,7 @@ import {
   NULL_VALUE,
   booleanValue,
   decimalValue,
+  freezeValue,
   int32Value,
   int64Value,
   listValue,
@@ -104,6 +106,11 @@ export interface InterpretOptions {
   meter?: TokenMeter;
   /** Stops the script before its next statement, expression or resource call once aborted. */
   signal?: AbortSignal;
+  /**
+   * Values the script reads as constants without declaring them, e.g. `{ jwt: {...} }`. They are
+   * read-only all the way down, and the script can't declare a variable or parameter with their names.
+   */
+  builtins?: Record<string, unknown>;
 }
 
 export interface InterpretResult {
@@ -116,6 +123,22 @@ export interface InterpretResult {
   };
 }
 
+const IDENTIFIER = /^[A-Za-z_][A-Za-z0-9_]*$/;
+const KEYWORD_SET = new Set<string>(KEYWORDS);
+
+/** The scope holding the host's built-in variables, frozen. A bad name is a host bug, not a script error. */
+function bindBuiltins(builtins: Record<string, unknown>): Environment {
+  const env = new Environment();
+  for (const [name, raw] of Object.entries(builtins)) {
+    if (!IDENTIFIER.test(name) || KEYWORD_SET.has(name)) {
+      throw new Error(`Invalid built-in variable name '${name}'`);
+    }
+    const value = freezeValue(hostToValue(raw, ANY_TYPE, `for built-in '${name}'`));
+    env.declare(name, { value, type: inferType(value), constant: true, builtin: true });
+  }
+  return env;
+}
+
 /** Thrown internally to unwind execution when a return statement runs. */
 class ReturnSignal {
   constructor(readonly value: Value) {}
@@ -125,6 +148,7 @@ interface Binding {
   value: Value;
   type: RuntimeType;
   constant: boolean;
+  builtin?: true;
 }
 
 class Environment {
@@ -133,7 +157,11 @@ class Environment {
   constructor(private readonly parent?: Environment) {}
 
   declare(name: string, binding: Binding, line?: number): void {
-    if (this.lookup(name) !== undefined) {
+    const existing = this.lookup(name);
+    if (existing?.builtin) {
+      throw new RuntimeError(`'${name}' is a built-in variable and cannot be redeclared`, line);
+    }
+    if (existing !== undefined) {
       throw new RuntimeError(`Variable '${name}' is already declared and cannot be redeclared`, line);
     }
     this.bindings.set(name, binding);
@@ -206,8 +234,13 @@ export class Interpreter {
     private readonly signal?: AbortSignal,
   ) {}
 
-  async run(script: Script, parameters?: Record<string, unknown>): Promise<InterpretResult> {
-    const root = new Environment();
+  async run(
+    script: Script,
+    parameters?: Record<string, unknown>,
+    builtins?: Record<string, unknown>,
+  ): Promise<InterpretResult> {
+    // Built-ins sit above the script's own scope, so no scope inside it can redeclare them.
+    const root = new Environment(bindBuiltins(builtins ?? {}));
     this.bindParameters(script.declaration, parameters, root);
 
     let result: Value = NULL_VALUE;
@@ -241,6 +274,9 @@ export class Interpreter {
       if (!declared.has(key)) throw new ParameterError(`Unknown parameter '${key}'`);
     }
     for (const parameter of declaration.parameters) {
+      if (env.lookup(parameter.name)?.builtin) {
+        throw new ParameterError(`Parameter '${parameter.name}' conflicts with a built-in variable`);
+      }
       if (!(parameter.name in provided)) {
         throw new ParameterError(`Missing parameter '${parameter.name}'`);
       }
@@ -343,6 +379,9 @@ export class Interpreter {
             line,
           );
         }
+        if (object.readonly) {
+          throw new RuntimeError(`Cannot set property '${target.property}' because the object is read-only`, line);
+        }
         object.entries.set(target.property, value);
         return;
       }
@@ -351,6 +390,9 @@ export class Interpreter {
         const index = await this.evaluate(target.index, env);
         if (object.kind !== 'list') {
           throw new RuntimeError(`Cannot index into ${valueTypeName(object)}`, line);
+        }
+        if (object.readonly) {
+          throw new RuntimeError('Cannot set an element because the list is read-only', line);
         }
         const i = this.indexNumber(index, object.elements.length, line);
         object.elements[i] = value;
@@ -750,5 +792,5 @@ export async function interpretParsed(script: Script, options: InterpretOptions 
     options.meter,
     options.signal,
   );
-  return interpreter.run(script, options.parameters);
+  return interpreter.run(script, options.parameters, options.builtins);
 }

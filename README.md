@@ -161,6 +161,25 @@ const limit = 10          // cannot be reassigned
 - Names cannot be redeclared, and this includes shadowing: declaring a name inside an `if` block that already exists in an enclosing scope is an error. Variables declared inside an `if` block are not visible after it.
 - Object properties and list elements can be modified in place, even through a `const` binding, since `const` only prevents rebinding the name: `obj.color = "red"`, `list[0] = 5`. Assigning a property that doesn't exist adds it. These element and property assignments are not checked against a list's element type.
 
+### Built-in variables
+
+A host can pass values a script reads without declaring them, through the `builtins` option:
+
+```ts
+await interpret(source, { builtins: { jwt: { sub: "cli_1", org: "org_1" } } });
+```
+
+```
+request ClientId {
+    return jwt.sub
+}
+```
+
+- Built-ins are constants, and read-only all the way down: `jwt = ...`, `jwt.sub = "x"` and `jwt.aud[0] = "x"` are runtime errors. So is changing one through another variable (`var copy = jwt` refers to the same value). Copy a field into a variable to work with it (`var sub = jwt.sub`).
+- Their names are reserved: declaring a variable with a built-in's name, in any scope, is a runtime error, and so is a contract parameter with that name (a `ParameterError`).
+- Values are converted like resource results: numbers become `int32`, `int64` or `decimal`, and objects and lists convert recursively. A `null` built-in still reserves its name.
+- Names must be identifiers and not keywords; anything else throws a plain `Error`, since it is a host bug.
+
 ### Expressions
 
 **Literals**: numbers, strings, `true`, `false`, `null`, objects, and lists.

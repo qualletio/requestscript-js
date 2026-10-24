@@ -14,8 +14,8 @@ export type Value =
   | { kind: 'boolean'; value: boolean }
   | { kind: 'string'; value: string }
   | { kind: 'null' }
-  | { kind: 'list'; elements: Value[] }
-  | { kind: 'object'; entries: Map<string, Value> }
+  | { kind: 'list'; elements: Value[]; readonly?: true }
+  | { kind: 'object'; entries: Map<string, Value>; readonly?: true }
   | { kind: 'resource'; resource: Resource };
 
 export const NULL_VALUE: Value = { kind: 'null' };
@@ -46,6 +46,18 @@ export function listValue(elements: Value[]): Value {
 
 export function objectValue(entries: Map<string, Value>): Value {
   return { kind: 'object', entries };
+}
+
+/** Marks a value and every list and object inside it read-only, in place, so scripts can't change them. */
+export function freezeValue(value: Value): Value {
+  if (value.kind === 'list') {
+    value.readonly = true;
+    value.elements.forEach(freezeValue);
+  } else if (value.kind === 'object') {
+    value.readonly = true;
+    value.entries.forEach(freezeValue);
+  }
+  return value;
 }
 
 export function isNumeric(value: Value): boolean {
