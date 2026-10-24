@@ -15,6 +15,7 @@ export {
   defaultResourceInvoker,
 } from './interpreter.js';
 export { tokenize } from './lexer.js';
+export { maxTokens, TokenLimitError, TokenMeter } from './meter.js';
 export { Parser, parseScript, parseTypeString } from './parser.js';
 export {
   resourceError,
