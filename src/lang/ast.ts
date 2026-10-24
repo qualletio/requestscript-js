@@ -42,6 +42,12 @@ export interface Script {
 
 // ---------- Statements ----------
 
+// Every statement and expression carries `tokens`: the number of lexer tokens
+// it owns, excluding the tokens owned by its child nodes, so summing `tokens`
+// over a set of nodes never counts a token twice. Tokens outside any node (the
+// declaration, its parameter list and the body's braces) are owned by none.
+// Script metering charges a node's `tokens` when the node executes.
+
 export interface VarDeclStatement {
   kind: 'varDecl';
   constant: boolean;
@@ -49,6 +55,7 @@ export interface VarDeclStatement {
   type?: TypeNode;
   value: Expression;
   line: number;
+  tokens: number;
 }
 
 /** `const name: dotted.path.ResourceName` — binds a host resource. */
@@ -58,6 +65,7 @@ export interface ResourceDeclStatement {
   resourcePath: string[];
   resourceName: string;
   line: number;
+  tokens: number;
 }
 
 export interface AssignStatement {
@@ -65,30 +73,39 @@ export interface AssignStatement {
   target: IdentifierExpr | MemberExpr | IndexExpr;
   value: Expression;
   line: number;
+  tokens: number;
 }
 
 export interface ReturnStatement {
   kind: 'return';
   value?: Expression;
   line: number;
+  tokens: number;
 }
 
 export interface IfBranch {
   condition: Expression;
   body: Statement[];
+  /** The branch's own tokens: `if` or `else if`, the condition's parentheses and the body's braces. */
+  tokens: number;
 }
 
+/** An if statement owns no tokens itself (`tokens` is 0); its branches and `else` own them. */
 export interface IfStatement {
   kind: 'if';
   branches: IfBranch[];
   elseBody?: Statement[];
+  /** The `else` keyword and the else body's braces, when there is an else body. */
+  elseTokens?: number;
   line: number;
+  tokens: number;
 }
 
 export interface ExpressionStatement {
   kind: 'exprStmt';
   expression: Expression;
   line: number;
+  tokens: number;
 }
 
 export type Statement =
@@ -105,29 +122,34 @@ export interface IntLiteralExpr {
   kind: 'intLiteral';
   value: bigint;
   line: number;
+  tokens: number;
 }
 
 export interface DecimalLiteralExpr {
   kind: 'decimalLiteral';
   raw: string;
   line: number;
+  tokens: number;
 }
 
 export interface BooleanLiteralExpr {
   kind: 'booleanLiteral';
   value: boolean;
   line: number;
+  tokens: number;
 }
 
 export interface NullLiteralExpr {
   kind: 'nullLiteral';
   line: number;
+  tokens: number;
 }
 
 export interface StringLiteralExpr {
   kind: 'stringLiteral';
   value: string;
   line: number;
+  tokens: number;
 }
 
 export type TemplatePart = { type: 'text'; value: string } | { type: 'expr'; expression: Expression };
@@ -137,24 +159,28 @@ export interface TemplateStringExpr {
   kind: 'templateString';
   parts: TemplatePart[];
   line: number;
+  tokens: number;
 }
 
 export interface ObjectLiteralExpr {
   kind: 'objectLiteral';
   entries: { key: string; value: Expression }[];
   line: number;
+  tokens: number;
 }
 
 export interface ListLiteralExpr {
   kind: 'listLiteral';
   elements: Expression[];
   line: number;
+  tokens: number;
 }
 
 export interface IdentifierExpr {
   kind: 'identifier';
   name: string;
   line: number;
+  tokens: number;
 }
 
 export interface MemberExpr {
@@ -162,6 +188,7 @@ export interface MemberExpr {
   object: Expression;
   property: string;
   line: number;
+  tokens: number;
 }
 
 export interface IndexExpr {
@@ -169,6 +196,7 @@ export interface IndexExpr {
   object: Expression;
   index: Expression;
   line: number;
+  tokens: number;
 }
 
 export interface NamedArgument {
@@ -182,6 +210,7 @@ export interface CallExpr {
   callee: MemberExpr;
   args: NamedArgument[];
   line: number;
+  tokens: number;
 }
 
 export type UnaryOperator = '!' | '-';
@@ -191,6 +220,7 @@ export interface UnaryExpr {
   operator: UnaryOperator;
   operand: Expression;
   line: number;
+  tokens: number;
 }
 
 export type BinaryOperator =
@@ -213,6 +243,7 @@ export interface BinaryExpr {
   left: Expression;
   right: Expression;
   line: number;
+  tokens: number;
 }
 
 export type Expression =

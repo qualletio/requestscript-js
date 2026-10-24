@@ -114,6 +114,7 @@ describe('parser: statements', () => {
       resourcePath: ['path', 'to'],
       resourceName: 'AddResource',
       line: 1,
+      tokens: 8,
     });
   });
 
@@ -132,7 +133,7 @@ describe('parser: statements', () => {
 
   it('parses bare and valued returns using line breaks', () => {
     const script = parseScript('request R { return\nreturn 1 }');
-    expect(script.body[0]).toEqual({ kind: 'return', line: 1 });
+    expect(script.body[0]).toEqual({ kind: 'return', line: 1, tokens: 1 });
     expect(script.body[1]).toMatchObject({ kind: 'return', value: { kind: 'intLiteral', value: 1n } });
   });
 
@@ -234,7 +235,7 @@ describe('parser: expressions', () => {
   });
 
   it('parses plain strings into string literals', () => {
-    expect(firstReturnValue('"Hello"')).toEqual({ kind: 'stringLiteral', value: 'Hello', line: 1 });
+    expect(firstReturnValue('"Hello"')).toEqual({ kind: 'stringLiteral', value: 'Hello', line: 1, tokens: 1 });
   });
 
   it('parses null literals', () => {

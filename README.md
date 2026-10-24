@@ -15,7 +15,7 @@ const result = await interpret(source, { resources, parameters });
 console.log(result.returnValue);
 ```
 
-Everything needed to build on the language is exported: `tokenize`, `parseScript`, the AST types, `Decimal`, the error classes, and the `Resource` interfaces.
+Everything needed to build on the language is exported: `tokenize`, `parseScript`, the AST types, `Decimal`, the error classes, the `Resource` interfaces, and [token metering](#token-metering) (`TokenMeter`, `maxTokens`).
 
 The HTTP server lives behind the `requestscript-js/server` subpath:
 
@@ -319,6 +319,31 @@ const remoteInvoker: ResourceInvoker = {
 
 An invoker may also throw, which is treated exactly like a thrown `exec`. The function name and arguments are validated before the invoker is called, so `invoke` only ever sees a function the resource declares with every parameter present.
 
+### Token metering
+
+Hosts can price and limit scripts by the tokens they execute. A token is one lexer token: an identifier, keyword, number, operator, punctuation mark, or a whole string literal however long.
+
+Each statement and expression owns the tokens it was parsed from, minus those owned by its children, and the interpreter counts a node's tokens just before running it. So a run counts exactly the code it executed:
+
+- The declaration (`request R`, or a contract's name, version and parameter list) and the body's outer braces are free.
+- An `if` counts each condition it evaluates together with that branch's `if`/`else if`, parentheses and braces, then the body of the branch it takes. The `else` keyword and its braces count only when the else body runs. Untaken branches cost nothing.
+- The operand a short-circuiting `&&` or `||` skips is not counted.
+- A string counts as one token, plus the tokens of each `${}` interpolation as it is evaluated.
+- Parentheses count with the expression that encloses them, and an assignment's target counts with the assignment.
+
+```ts
+import { interpret, maxTokens, parseScript, TokenMeter } from "requestscript-js";
+
+const script = parseScript(source);
+maxTokens(script); // the most any run can execute: each if takes its costliest path
+
+const meter = new TokenMeter(10_000); // optional limit
+const result = await interpret(source, { meter, signal });
+result.usage.tokens; // also on meter.tokens, which survives a failed run
+```
+
+Because there are no loops or user-defined functions, `maxTokens` is a finite bound known before the script runs. A node that would take the count past the meter's limit is not run, and the script fails with `TokenLimitError` (a `RuntimeError`). `signal` is an `AbortSignal`, checked before each statement, expression and resource call.
+
 ### JSON encoding
 
 A script's return value is encoded as JSON under `returnValue`. Lists and objects map to arrays and objects, and `int32`, `boolean`, `string`, and `null` map directly. `int64` and `decimal` values are encoded as JSON numbers when that is lossless, and otherwise as strings (e.g. `"9223372036854775807"`).
@@ -331,7 +356,7 @@ Interpreter failures are thrown as typed errors, which the server maps to HTTP s
 
 - `LexError` and `ParseError` (HTTP `400`) cover malformed source: unknown characters, unterminated strings, unknown types, duplicate keys or parameters, a missing declaration, and so on. They carry a line and column.
 - `ParameterError` (HTTP `400`) is raised for missing, unknown, or wrongly-typed contract parameters.
-- `RuntimeError` (HTTP `422`) covers everything detected while running: type mismatches, unknown variables, redeclaration, assigning to a `const`, overflow, division by zero, out-of-bounds indexes, and non-boolean conditions. It carries a line number.
+- `RuntimeError` (HTTP `422`) covers everything detected while running: type mismatches, unknown variables, redeclaration, assigning to a `const`, overflow, division by zero, out-of-bounds indexes, non-boolean conditions, and passing a meter's token limit (`TokenLimitError`). It carries a line number.
 
 A resource function failing is not one of these. It is reported to the script as `error` on the call's result, and the request still succeeds — see [Resources](#resources).
 

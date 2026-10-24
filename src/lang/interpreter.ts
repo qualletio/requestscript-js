@@ -8,6 +8,7 @@ import type {
 } from './ast.js';
 import { Decimal, DecimalArithmeticError } from './decimal.js';
 import { ParameterError, RuntimeError } from './errors.js';
+import { TokenMeter } from './meter.js';
 import { parseScript, parseTypeString } from './parser.js';
 import {
   resourceKey,
@@ -96,12 +97,23 @@ export interface InterpretOptions {
   resourceInvoker?: ResourceInvoker;
   /** Contract parameter values (as parsed JSON). */
   parameters?: Record<string, unknown>;
+  /**
+   * Counts the tokens the script executes, and stops it at the meter's limit.
+   * Pass one to read the count after a failed run too.
+   */
+  meter?: TokenMeter;
+  /** Stops the script before its next statement, expression or resource call once aborted. */
+  signal?: AbortSignal;
 }
 
 export interface InterpretResult {
   declaration: Declaration;
   /** The script's return value, already encoded as a JSON-compatible value. */
   returnValue: unknown;
+  usage: {
+    /** The tokens the script executed (see `TokenMeter`). */
+    tokens: number;
+  };
 }
 
 /** Thrown internally to unwind execution when a return statement runs. */
@@ -187,7 +199,12 @@ function describeResult(raw: unknown): string {
 }
 
 export class Interpreter {
-  constructor(private readonly resourceResolver: ResourceResolver, private readonly resourceInvoker: ResourceInvoker) {}
+  constructor(
+    private readonly resourceResolver: ResourceResolver,
+    private readonly resourceInvoker: ResourceInvoker,
+    private readonly meter: TokenMeter = new TokenMeter(),
+    private readonly signal?: AbortSignal,
+  ) {}
 
   async run(script: Script, parameters?: Record<string, unknown>): Promise<InterpretResult> {
     const root = new Environment();
@@ -203,7 +220,7 @@ export class Interpreter {
         throw error;
       }
     }
-    return { declaration: script.declaration, returnValue: valueToJson(result) };
+    return { declaration: script.declaration, returnValue: valueToJson(result), usage: { tokens: this.meter.tokens } };
   }
 
   private bindParameters(
@@ -241,6 +258,8 @@ export class Interpreter {
   }
 
   private async execStatement(statement: Statement, env: Environment): Promise<void> {
+    this.signal?.throwIfAborted();
+    this.meter.charge(statement.tokens, statement.line);
     switch (statement.kind) {
       case 'varDecl': {
         const raw = await this.evaluate(statement.value, env);
@@ -272,6 +291,7 @@ export class Interpreter {
       }
       case 'if': {
         for (const branch of statement.branches) {
+          this.meter.charge(branch.tokens, statement.line);
           const condition = await this.evaluate(branch.condition, env);
           if (condition.kind !== 'boolean') {
             throw new RuntimeError(
@@ -284,6 +304,7 @@ export class Interpreter {
           }
         }
         if (statement.elseBody) {
+          this.meter.charge(statement.elseTokens ?? 0, statement.line);
           return this.execStatements(statement.elseBody, new Environment(env));
         }
         return;
@@ -302,6 +323,8 @@ export class Interpreter {
   ): Promise<void> {
     const value = requireData(await this.evaluate(valueExpr, env), line);
 
+    // The target is never evaluated as a whole, so its own tokens are charged here.
+    this.meter.charge(target.tokens, line);
     switch (target.kind) {
       case 'identifier': {
         const binding = env.lookup(target.name);
@@ -350,6 +373,8 @@ export class Interpreter {
   // ---------- expressions ----------
 
   private async evaluate(expression: Expression, env: Environment): Promise<Value> {
+    this.signal?.throwIfAborted();
+    this.meter.charge(expression.tokens, expression.line);
     switch (expression.kind) {
       case 'intLiteral': {
         const value = expression.value;
@@ -455,6 +480,8 @@ export class Interpreter {
   }
 
   private async evalCall(expression: CallExpr, env: Environment): Promise<Value> {
+    // The callee is never evaluated as a whole, so its own tokens are charged here.
+    this.meter.charge(expression.callee.tokens, expression.line);
     const target = await this.evaluate(expression.callee.object, env);
     if (target.kind !== 'resource') {
       throw new RuntimeError(`Cannot call '${expression.callee.property}' on ${valueTypeName(target)}`, expression.line);
@@ -488,6 +515,7 @@ export class Interpreter {
       callParameters.push({ name: parameter.name, value: valueToHost(coerced) });
     }
 
+    this.signal?.throwIfAborted();
     let raw: unknown;
     try {
       raw = await this.resourceInvoker.invoke(resource, fn.name, callParameters);
@@ -716,6 +744,11 @@ export async function interpret(source: string, options: InterpretOptions = {}):
 
 /** Executes an already-parsed script. */
 export async function interpretParsed(script: Script, options: InterpretOptions = {}): Promise<InterpretResult> {
-  const interpreter = new Interpreter(options.resourceResolver ?? new DefaultResourceResolver(new Map()), options.resourceInvoker ?? defaultResourceInvoker);
+  const interpreter = new Interpreter(
+    options.resourceResolver ?? new DefaultResourceResolver(new Map()),
+    options.resourceInvoker ?? defaultResourceInvoker,
+    options.meter,
+    options.signal,
+  );
   return interpreter.run(script, options.parameters);
 }
