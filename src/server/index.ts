@@ -1,6 +1,6 @@
 export { createApp, type AppOptions } from './app.js';
+export { compareVersions } from '../lang/versions.js';
 export {
-  compareVersions,
   declaredParameters,
   deleteContract,
   findContract,

@@ -124,7 +124,8 @@ export class Parser {
     const name = segments.pop()!;
     const version = this.match('@') ? this.parseContractVersion() : '1';
     const parameters: ParameterDecl[] = this.check('(') ? this.parseParameterList() : [];
-    return { kind: 'contract', path: segments, name, version, parameters };
+    const returnType = this.match(':') ? this.parseType() : undefined;
+    return { kind: 'contract', path: segments, name, version, parameters, ...(returnType && { returnType }) };
   }
 
   /**

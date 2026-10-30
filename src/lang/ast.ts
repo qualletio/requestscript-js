@@ -31,6 +31,8 @@ export interface ContractDecl {
   /** Declared with '@<version>' after the name — dot-separated numbers such as '2' or '1.2.3'; '1' when omitted. */
   version: string;
   parameters: ParameterDecl[];
+  /** Declared with ': type' after the parameters. The contract's return value is checked against it. */
+  returnType?: TypeNode;
 }
 
 export type Declaration = RequestDecl | ContractDecl;

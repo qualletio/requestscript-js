@@ -28,6 +28,7 @@ export {
   type ResourceFunctionParameter,
   type ResourceResult,
 } from './resource.js';
+export { compareVersions } from './versions.js';
 export { typeToString, valueToJson, type RuntimeType } from './types.js';
 export type { Value } from './values.js';
 export type { StringPart, Token, TokenType } from './token.js';

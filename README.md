@@ -15,7 +15,7 @@ const result = await interpret(source, { resources, parameters });
 console.log(result.returnValue);
 ```
 
-Everything needed to build on the language is exported: `tokenize`, `parseScript`, the AST types, `Decimal`, the error classes, the `Resource` interfaces, and [token metering](#token-metering) (`TokenMeter`, `maxTokens`).
+Everything needed to build on the language is exported: `tokenize`, `parseScript`, the AST types, `Decimal`, the error classes, the `Resource` interfaces, [token metering](#token-metering) (`TokenMeter`, `maxTokens`), and `compareVersions` for ordering contract versions.
 
 The HTTP server lives behind the `requestscript-js/server` subpath:
 
@@ -128,6 +128,7 @@ contract path.to.MyContract@1.2.3(name: string, tags: []string,) {
 - The name may be preceded by a dot-separated path. Path segments may be any word, including keywords (`contract if.else.Thing` is allowed).
 - The optional `@<version>` is one or more dot-separated numbers with no spaces (`@2`, `@1.5`, `@1.2.3`, or deeper) and defaults to `1`. Versions are compared numerically per segment, with missing segments counting as 0, so `@1.10` is newer than `@1.9`. Versions are matched exactly as written, so `@1.0` and `@1` are distinct. See [HTTP API](#http-api) for how versions are stored and invoked.
 - Parameters are `name: type` pairs, separated by commas, with an optional trailing comma. Names must be unique. A parameterless contract omits the parentheses entirely; `()` is an error.
+- An optional return type follows the parameters after a colon: `contract shop.Total(items: []object): decimal { ... }`, or `contract shop.Count: int32 { ... }` without parameters. The value the contract returns is converted to that type like an assignment (`int32` widens to `decimal`, `null` is always allowed), and any other value is a runtime error. A contract without one may return anything.
 - Parameters are `const` bindings. When invoked, every declared parameter must be supplied, unknown parameters are rejected, and each value is converted to its declared type (see [JSON encoding](#json-encoding)). Supplying parameters to a `request` script is an error.
 
 ### Types
