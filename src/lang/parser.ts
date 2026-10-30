@@ -23,6 +23,9 @@ const BUILTIN_TYPE_NAMES = new Set(['int32', 'int64', 'decimal', 'boolean', 'str
 
 export class Parser {
   private pos = 0;
+  /** What is being parsed, and how many blocks deep: state variables are only allowed at a contract's top level. */
+  private declarationKind: 'request' | 'contract' | undefined;
+  private depth = 0;
   /** Each node's full token span, children included, so a parent can work out the tokens it owns. */
   private readonly spans = new WeakMap<object, number>();
 
@@ -94,11 +97,13 @@ export class Parser {
 
   private parseDeclarationAndBody(): Script {
     if (this.match('request')) {
+      this.declarationKind = 'request';
       const name = this.expect('identifier', 'as the request name').value;
       const body = this.parseBlock();
       return { declaration: { kind: 'request', name }, body };
     }
     if (this.match('contract')) {
+      this.declarationKind = 'contract';
       const declaration = this.parseContractDecl();
       const body = this.parseBlock();
       return { declaration, body };
@@ -230,13 +235,24 @@ export class Parser {
 
   private parseBlock(): Statement[] {
     this.expect('{', 'to start a block');
+    this.depth++;
     const statements: Statement[] = [];
     while (!this.check('}')) {
       if (this.check('eof')) throw this.error(`Expected '}' to close a block`);
       statements.push(this.parseStatement());
     }
     this.expect('}', 'to end a block');
+    this.depth--;
     return statements;
+  }
+
+  /**
+   * `state` is not a keyword: it starts a state declaration only when a name or a `(scope)` follows it, so
+   * `var state = 1` still declares a variable called `state`.
+   */
+  private atStateModifier(): boolean {
+    const next = this.peek(1).type;
+    return this.check('identifier') && this.peek().value === 'state' && (next === 'identifier' || next === '(');
   }
 
   private parseStatement(): Statement {
@@ -258,6 +274,24 @@ export class Parser {
   private parseVarDecl(constant: boolean): Statement {
     const start = this.pos;
     const keyword = this.advance(); // var or const
+    let state: { scope?: Expression } | undefined;
+    if (this.atStateModifier()) {
+      const modifier = this.advance();
+      if (constant) {
+        throw this.error(`State variables must be declared with 'var'`, modifier);
+      }
+      if (this.declarationKind !== 'contract') {
+        throw this.error(`State variables can only be declared in a contract`, modifier);
+      }
+      if (this.depth !== 1) {
+        throw this.error(`State variables must be declared at the top level of the contract body`, modifier);
+      }
+      state = {};
+      if (this.match('(')) {
+        state.scope = this.parseExpression();
+        this.expect(')', 'after the state scope');
+      }
+    }
     const nameToken = this.expect('identifier', `as the ${constant ? 'const' : 'var'} name`);
     const name = nameToken.value;
 
@@ -265,6 +299,9 @@ export class Parser {
     if (this.match(':')) {
       // A non-builtin dotted type name is a resource reference declaration.
       if (this.check('identifier') && !BUILTIN_TYPE_NAMES.has(this.peek().value)) {
+        if (state) {
+          throw this.error(`A state variable can't hold a resource reference`, keyword);
+        }
         return this.parseResourceDecl(constant, name, keyword, start);
       }
       type = this.parseType();
@@ -274,7 +311,8 @@ export class Parser {
     const value = this.parseExpression();
     const statement: VarDeclStatement = { kind: 'varDecl', constant, name, value, line: keyword.line, tokens: 0 };
     if (type !== undefined) statement.type = type;
-    return this.owned(statement, start, [value]);
+    if (state) statement.state = state;
+    return this.owned(statement, start, state?.scope ? [value, state.scope] : [value]);
   }
 
   private parseResourceDecl(constant: boolean, name: string, keyword: Token, start: number): Statement {

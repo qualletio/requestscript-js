@@ -406,3 +406,55 @@ export function valueToHost(value: Value): unknown {
       throw new RuntimeError('A resource reference cannot be passed to a resource function');
   }
 }
+
+/**
+ * A value as JSON that keeps every kind exactly, for a host to store and read back with `decodeValue`:
+ * `int64` is `{ "$int64": "..." }`, `decimal` is `{ "$decimal": "..." }` with its scale, and an object is
+ * `{ "$object": {...} }` so its keys can't be mistaken for those. Other values are plain JSON.
+ */
+export type EncodedValue = null | boolean | number | string | EncodedValue[] | { $int64: string } | { $decimal: string } | { $object: Record<string, EncodedValue> };
+
+export function encodeValue(value: Value): EncodedValue {
+  switch (value.kind) {
+    case 'null':
+      return null;
+    case 'boolean':
+    case 'string':
+    case 'int32':
+      return value.value;
+    case 'int64':
+      return { $int64: value.value.toString() };
+    case 'decimal':
+      return { $decimal: value.value.toString() };
+    case 'list':
+      return value.elements.map(encodeValue);
+    case 'object': {
+      const entries: Record<string, EncodedValue> = {};
+      for (const [key, entry] of value.entries) entries[key] = encodeValue(entry);
+      return { $object: entries };
+    }
+    case 'resource':
+      throw new RuntimeError('A resource reference cannot be stored');
+  }
+}
+
+/** Reads back what `encodeValue` wrote. Throws a plain Error for anything else, since that is a host bug. */
+export function decodeValue(encoded: unknown): Value {
+  if (encoded === null) return NULL_VALUE;
+  if (typeof encoded === 'boolean') return booleanValue(encoded);
+  if (typeof encoded === 'string') return stringValue(encoded);
+  if (typeof encoded === 'number' && Number.isInteger(encoded) && encoded >= Number(INT32_MIN) && encoded <= Number(INT32_MAX)) {
+    return int32Value(encoded);
+  }
+  if (Array.isArray(encoded)) return listValue(encoded.map(decodeValue));
+  if (typeof encoded === 'object') {
+    const record = encoded as Record<string, unknown>;
+    const keys = Object.keys(record);
+    if (keys.length === 1 && typeof record['$int64'] === 'string') return int64Value(BigInt(record['$int64']));
+    if (keys.length === 1 && typeof record['$decimal'] === 'string') return decimalValue(Decimal.fromString(record['$decimal']));
+    if (keys.length === 1 && typeof record['$object'] === 'object' && record['$object'] !== null && !Array.isArray(record['$object'])) {
+      return objectValue(new Map(Object.entries(record['$object'] as Record<string, unknown>).map(([key, entry]) => [key, decodeValue(entry)])));
+    }
+  }
+  throw new Error(`Invalid encoded value: ${JSON.stringify(encoded)}`);
+}
