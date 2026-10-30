@@ -40,6 +40,15 @@ describe('parser: declarations', () => {
     expect((script.declaration as ContractDecl).version).toBe('12');
   });
 
+  it('parses a declared return type', () => {
+    const returnType = (source: string) => (parseScript(source).declaration as ContractDecl).returnType;
+    expect(returnType('contract a.B(p: string): int32 { }')).toEqual({ kind: 'int32' });
+    expect(returnType('contract a.B@2: []string { }')).toEqual({ kind: 'list', element: { kind: 'string' } });
+    expect(returnType('contract a.B: decimal(10, 2) { }')).toEqual({ kind: 'decimal', intDigits: 10, fracDigits: 2 });
+    expect(returnType('contract a.B(p: string) { }')).toBeUndefined();
+    expect(() => parseScript('contract a.B(p: string): { }')).toThrow();
+  });
+
   it('parses decimal and semantic versions', () => {
     const version = (source: string) => (parseScript(source).declaration as ContractDecl).version;
     expect(version('contract C@1.5 { }')).toBe('1.5');

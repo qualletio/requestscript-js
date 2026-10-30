@@ -253,6 +253,9 @@ export class Interpreter {
         throw error;
       }
     }
+    if (script.declaration.kind === 'contract' && script.declaration.returnType) {
+      result = coerce(result, script.declaration.returnType, 'returned from the contract');
+    }
     return { declaration: script.declaration, returnValue: valueToJson(result), usage: { tokens: this.meter.tokens } };
   }
 

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { ParameterError } from '../src/lang/errors.js';
+import { ParameterError, RuntimeError } from '../src/lang/errors.js';
 import { run } from './helpers.js';
 
 describe('interpreter: contract parameters', () => {
@@ -69,5 +69,27 @@ describe('interpreter: contract parameters', () => {
 
   it('runs a parameterless contract without a parameters object', async () => {
     expect(await run('contract MyParameterlessContract { return "ok" }')).toBe('ok');
+  });
+});
+
+describe('interpreter: contract return types', () => {
+  it('returns a value of the declared type, with numeric promotion', async () => {
+    expect(await run('contract a.Count: int32 { return 2 }')).toBe(2);
+    expect(await run('contract a.Price: decimal { return 2 }')).toBe(2);
+    expect(await run('contract a.Names: []string { return ["a", "b"] }')).toEqual(['a', 'b']);
+  });
+
+  it('allows null, including a bare return or no return', async () => {
+    expect(await run('contract a.Nothing: string { return null }')).toBeNull();
+    expect(await run('contract a.Nothing: string { }')).toBeNull();
+  });
+
+  it('rejects a value of another type with RuntimeError', async () => {
+    await expect(run('contract a.Count: int32 { return "two" }')).rejects.toThrow(RuntimeError);
+    await expect(run('contract a.Price: decimal(1, 1) { return 2.25 }')).rejects.toThrow(/returned from the contract/);
+  });
+
+  it('leaves contracts without a return type unchecked', async () => {
+    expect(await run('contract a.Any { return "anything" }')).toBe('anything');
   });
 });
