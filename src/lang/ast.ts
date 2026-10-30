@@ -56,6 +56,11 @@ export interface VarDeclStatement {
   name: string;
   type?: TypeNode;
   value: Expression;
+  /**
+   * Set for `var state name = ...` or `var state(scope) name = ...` at the top level of a contract: a value
+   * the host keeps between invocations, one per value of `scope` when it has one.
+   */
+  state?: { scope?: Expression };
   line: number;
   tokens: number;
 }

@@ -42,7 +42,8 @@ function blockMax(statements: Statement[]): number {
 function statementMax(statement: Statement): number {
   switch (statement.kind) {
     case 'varDecl':
-      return statement.tokens + expressionMax(statement.value);
+      // A state variable's initializer runs only when nothing is stored yet, but may run.
+      return statement.tokens + expressionMax(statement.value) + (statement.state?.scope ? expressionMax(statement.state.scope) : 0);
     case 'resourceDecl':
       return statement.tokens;
     case 'assign':

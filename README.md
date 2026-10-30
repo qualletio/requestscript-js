@@ -15,7 +15,7 @@ const result = await interpret(source, { resources, parameters });
 console.log(result.returnValue);
 ```
 
-Everything needed to build on the language is exported: `tokenize`, `parseScript`, the AST types, `Decimal`, the error classes, the `Resource` interfaces, [token metering](#token-metering) (`TokenMeter`, `maxTokens`), and `compareVersions` for ordering contract versions.
+Everything needed to build on the language is exported: `tokenize`, `parseScript`, the AST types, `Decimal`, the error classes, the `Resource` interfaces, [token metering](#token-metering) (`TokenMeter`, `maxTokens`), `compareVersions` for ordering contract versions, and the [state variable](#state-variables) store types with `encodeValue` and `decodeValue`.
 
 The HTTP server lives behind the `requestscript-js/server` subpath:
 
@@ -180,6 +180,42 @@ request ClientId {
 - Their names are reserved: declaring a variable with a built-in's name, in any scope, is a runtime error, and so is a contract parameter with that name (a `ParameterError`).
 - Values are converted like resource results: numbers become `int32`, `int64` or `decimal`, and objects and lists convert recursively. A `null` built-in still reserves its name.
 - Names must be identifiers and not keywords; anything else throws a plain `Error`, since it is a host bug.
+
+### State variables
+
+A contract can keep values between invocations in **state variables**, declared with `var state` at the top level of its body:
+
+```
+contract shop.Visits(page: string): int32 {
+    var state total: int32 = 0
+    var state(page) perPage: int32 = 0
+
+    total = total + 1
+    perPage = perPage + 1
+    return perPage
+}
+```
+
+- `var state name = value` is one copy shared by every invocation. `var state(scope) name = value` keeps one copy per value of `scope`, any expression that evaluates to a string or an integer. Scopes keep their kind, so `3` and `"3"` are different copies.
+- When the declaration runs, the stored copy is loaded. If there isn't one yet, the initializer runs, and it can use parameters and built-ins. The initializer's tokens are metered only when it runs.
+- A state variable is an ordinary `var` in the body. Assignments and in-place changes to its lists and objects are all kept.
+- A stored value is converted to the declaration's type, as an assignment would be, so a later version of a contract can widen a type. A value that doesn't fit is a runtime error. Without a declared type, the variable keeps the type it was first stored with.
+- State variables must be `var`, at the top level of a contract body, and can't hold resources. Anything else is a parse error. `state` isn't a reserved word, so `var state = 1` still declares a variable called `state`.
+
+The interpreter doesn't store anything itself. A host passes a `state` store to `interpret`, which loads each variable when its declaration runs. The run returns the final values in `result.state`, and the host saves them all only if the run succeeded:
+
+```ts
+import { interpret, type StateStore } from "requestscript";
+
+const store: StateStore = {
+  // Returns { value, type, version } as last saved, or undefined.
+  get: async (name, scope) => load(name, scope),
+};
+const result = await interpret(source, { state: store, parameters });
+await save(result.state); // [{ name, scope, value, type, version? }]
+```
+
+`value` is `encodeValue`'s lossless JSON (it keeps `int64` and `decimal` exactly), and `type` is the variable's type, to store beside it. `version` is whatever the host's `get` returned, so it can refuse to save over a copy that changed during the run. Declaring a state variable without a store is a runtime error, so the HTTP server in `requestscript/server`, which has none, runs no contract that declares state.
 
 ### Expressions
 

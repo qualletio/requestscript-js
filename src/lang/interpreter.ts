@@ -5,6 +5,7 @@ import type {
   Expression,
   Script,
   Statement,
+  VarDeclStatement,
 } from './ast.js';
 import { Decimal, DecimalArithmeticError } from './decimal.js';
 import { ParameterError, RuntimeError } from './errors.js';
@@ -21,7 +22,10 @@ import {
 import {
   ANY_TYPE,
   coerce,
+  decodeValue,
   displayString,
+  encodeValue,
+  type EncodedValue,
   hostToValue,
   inferType,
   parameterToValue,
@@ -111,6 +115,38 @@ export interface InterpretOptions {
    * read-only all the way down, and the script can't declare a variable or parameter with their names.
    */
   builtins?: Record<string, unknown>;
+  /**
+   * Where a contract's `var state` variables are read from. Without one, declaring one is a runtime error.
+   * The run doesn't write: it returns the final values in `InterpretResult.state` for the host to save.
+   */
+  state?: StateStore;
+}
+
+/** Which copy of a state variable: the shared one (`null`), or the one for a scope's value, which keeps its kind. */
+export type StateScope = null | { kind: 'string' | 'integer'; key: string };
+
+/** A state variable as a host stored it from a `StateWrite`. */
+export interface StoredState {
+  value: EncodedValue;
+  type: string;
+  /** Whatever the host uses to tell whether the value changed since it was read. Returned in the variable's write. */
+  version?: unknown;
+}
+
+export interface StateStore {
+  /** The stored copy of state variable `name` for `scope`, or undefined when there is none yet. */
+  get(name: string, scope: StateScope): Promise<StoredState | undefined>;
+}
+
+/** The final value of a state variable the run declared. A host saves every write of a run, or none. */
+export interface StateWrite {
+  name: string;
+  scope: StateScope;
+  value: EncodedValue;
+  /** The variable's runtime type, as JSON. Store it with the value. */
+  type: string;
+  /** The stored copy's `version`, or undefined when the run initialized the variable. */
+  version?: unknown;
 }
 
 export interface InterpretResult {
@@ -121,6 +157,8 @@ export interface InterpretResult {
     /** The tokens the script executed (see `TokenMeter`). */
     tokens: number;
   };
+  /** The final values of the state variables the run declared, for the host to save. Empty without any. */
+  state: StateWrite[];
 }
 
 const IDENTIFIER = /^[A-Za-z_][A-Za-z0-9_]*$/;
@@ -169,6 +207,19 @@ class Environment {
 
   lookup(name: string): Binding | undefined {
     return this.bindings.get(name) ?? this.parent?.lookup(name);
+  }
+}
+
+/** A state scope must be a string or an integer. Its kind is kept, so `3` and `"3"` are different scopes. */
+function stateScope(name: string, value: Value, line: number): StateScope {
+  switch (value.kind) {
+    case 'string':
+      return { kind: 'string', key: value.value };
+    case 'int32':
+    case 'int64':
+      return { kind: 'integer', key: String(value.value) };
+    default:
+      throw new RuntimeError(`The scope of state variable '${name}' must be a string or an integer, not ${valueTypeName(value)}`, line);
   }
 }
 
@@ -232,7 +283,11 @@ export class Interpreter {
     private readonly resourceInvoker: ResourceInvoker,
     private readonly meter: TokenMeter = new TokenMeter(),
     private readonly signal?: AbortSignal,
+    private readonly stateStore?: StateStore,
   ) {}
+
+  /** The state variables declared in the current run, with their bindings, which hold their latest values. */
+  private stateBindings: { name: string; scope: StateScope; binding: Binding; version?: unknown }[] = [];
 
   async run(
     script: Script,
@@ -242,6 +297,7 @@ export class Interpreter {
     // Built-ins sit above the script's own scope, so no scope inside it can redeclare them.
     const root = new Environment(bindBuiltins(builtins ?? {}));
     this.bindParameters(script.declaration, parameters, root);
+    this.stateBindings = [];
 
     let result: Value = NULL_VALUE;
     try {
@@ -256,7 +312,42 @@ export class Interpreter {
     if (script.declaration.kind === 'contract' && script.declaration.returnType) {
       result = coerce(result, script.declaration.returnType, 'returned from the contract');
     }
-    return { declaration: script.declaration, returnValue: valueToJson(result), usage: { tokens: this.meter.tokens } };
+    // In-place changes to lists and objects are in the bindings' values too.
+    const state = this.stateBindings.map(({ name, scope, binding, version }): StateWrite => ({
+      name,
+      scope,
+      value: encodeValue(binding.value),
+      type: JSON.stringify(binding.type),
+      ...(version === undefined ? {} : { version }),
+    }));
+    return { declaration: script.declaration, returnValue: valueToJson(result), usage: { tokens: this.meter.tokens }, state };
+  }
+
+  /**
+   * Declares a state variable: the stored copy for its scope, converted to its declared type, or else its
+   * initializer's value. The initializer runs, and is metered, only when nothing is stored.
+   */
+  private async declareState(statement: VarDeclStatement, env: Environment): Promise<void> {
+    const { name, line } = statement;
+    if (!this.stateStore) {
+      throw new RuntimeError(`State variable '${name}' needs a host that keeps contract state`, line);
+    }
+    const scope = statement.state?.scope ? stateScope(name, requireData(await this.evaluate(statement.state.scope, env), line), line) : null;
+    const stored = await this.stateStore.get(name, scope);
+    let value: Value;
+    let type: RuntimeType;
+    if (stored) {
+      const decoded = decodeValue(stored.value);
+      type = statement.type ?? (JSON.parse(stored.type) as RuntimeType);
+      value = coerce(decoded, type, `in the stored value of state variable '${name}'`, line);
+    } else {
+      value = requireData(await this.evaluate(statement.value, env), line);
+      type = statement.type ?? inferType(value);
+      if (statement.type) value = coerce(value, statement.type, `in the declaration of '${name}'`, line);
+    }
+    const binding: Binding = { value, type, constant: false };
+    env.declare(name, binding, line);
+    this.stateBindings.push({ name, scope, binding, version: stored?.version });
   }
 
   private bindParameters(
@@ -301,6 +392,9 @@ export class Interpreter {
     this.meter.charge(statement.tokens, statement.line);
     switch (statement.kind) {
       case 'varDecl': {
+        if (statement.state) {
+          return this.declareState(statement, env);
+        }
         const raw = await this.evaluate(statement.value, env);
         const value = requireData(raw, statement.line);
         const type: RuntimeType = statement.type ?? inferType(value);
@@ -794,6 +888,7 @@ export async function interpretParsed(script: Script, options: InterpretOptions 
     options.resourceInvoker ?? defaultResourceInvoker,
     options.meter,
     options.signal,
+    options.state,
   );
   return interpreter.run(script, options.parameters, options.builtins);
 }
