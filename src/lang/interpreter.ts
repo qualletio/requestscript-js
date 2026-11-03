@@ -2,6 +2,8 @@ import type {
   BinaryExpr,
   CallExpr,
   Declaration,
+  EmitStatement,
+  EventRef,
   Expression,
   Script,
   Statement,
@@ -120,6 +122,33 @@ export interface InterpretOptions {
    * The run doesn't write: it returns the final values in `InterpretResult.state` for the host to save.
    */
   state?: StateStore;
+  /**
+   * The event types the script may emit, and the one an event contract consumes. Without one, `emit` and
+   * running an event contract are runtime errors. The run doesn't publish: it returns its events in
+   * `InterpretResult.events` for the host to publish.
+   */
+  events?: EventResolver;
+}
+
+/** An event type as the host knows it. Field types are type strings, as for resource functions. */
+export interface EventType {
+  path: string;
+  name: string;
+  version: string;
+  fields: { name: string; type: string }[];
+}
+
+export interface EventResolver {
+  /** The event type `path.name`, at `version`, or the version the host picks when it is omitted. */
+  resolve(path: string, name: string, version?: string): Promise<EventType | undefined>;
+}
+
+/** An event the run emitted, with its data as JSON, in the order the run emitted it. */
+export interface EmittedEvent {
+  path: string;
+  name: string;
+  version: string;
+  data: Record<string, unknown>;
 }
 
 /** Which copy of a state variable: the shared one (`null`), or the one for a scope's value, which keeps its kind. */
@@ -159,6 +188,8 @@ export interface InterpretResult {
   };
   /** The final values of the state variables the run declared, for the host to save. Empty without any. */
   state: StateWrite[];
+  /** The events the run emitted, for the host to publish. Empty without any. */
+  events: EmittedEvent[];
 }
 
 const IDENTIFIER = /^[A-Za-z_][A-Za-z0-9_]*$/;
@@ -284,7 +315,11 @@ export class Interpreter {
     private readonly meter: TokenMeter = new TokenMeter(),
     private readonly signal?: AbortSignal,
     private readonly stateStore?: StateStore,
+    private readonly eventResolver?: EventResolver,
   ) {}
+
+  /** The events emitted in the current run. */
+  private emitted: EmittedEvent[] = [];
 
   /** The state variables declared in the current run, with their bindings, which hold their latest values. */
   private stateBindings: { name: string; scope: StateScope; binding: Binding; version?: unknown }[] = [];
@@ -295,9 +330,13 @@ export class Interpreter {
     builtins?: Record<string, unknown>,
   ): Promise<InterpretResult> {
     // Built-ins sit above the script's own scope, so no scope inside it can redeclare them.
+    if (script.declaration.kind === 'event') {
+      throw new RuntimeError('An event declaration declares an event type; it does not run');
+    }
     const root = new Environment(bindBuiltins(builtins ?? {}));
-    this.bindParameters(script.declaration, parameters, root);
+    await this.bindParameters(script.declaration, parameters, root);
     this.stateBindings = [];
+    this.emitted = [];
 
     let result: Value = NULL_VALUE;
     try {
@@ -320,7 +359,7 @@ export class Interpreter {
       type: JSON.stringify(binding.type),
       ...(version === undefined ? {} : { version }),
     }));
-    return { declaration: script.declaration, returnValue: valueToJson(result), usage: { tokens: this.meter.tokens }, state };
+    return { declaration: script.declaration, returnValue: valueToJson(result), usage: { tokens: this.meter.tokens }, state, events: this.emitted };
   }
 
   /**
@@ -350,24 +389,57 @@ export class Interpreter {
     this.stateBindings.push({ name, scope, binding, version: stored?.version });
   }
 
-  private bindParameters(
+  /** The event type `ref` names, or a runtime error when the host has none. */
+  private async resolveEvent(ref: EventRef, line?: number): Promise<EventType> {
+    const label = eventLabel(ref);
+    if (!this.eventResolver) {
+      throw new RuntimeError(`Event '${label}' needs a host that publishes events`, line);
+    }
+    const event = await this.eventResolver.resolve(ref.path.join('.'), ref.name, ref.version);
+    if (!event) {
+      throw new RuntimeError(`Unknown event '${label}'`, line);
+    }
+    return event;
+  }
+
+  /** An event field's type, parsed from the host's type string. */
+  private fieldType(event: EventType, field: { name: string; type: string }, line?: number): RuntimeType {
+    try {
+      return parseTypeString(field.type);
+    } catch {
+      throw new RuntimeError(`Event '${event.path}.${event.name}' declares an invalid type '${field.type}' for field '${field.name}'`, line);
+    }
+  }
+
+  /**
+   * Binds a contract's parameters, or an event contract's event fields, which the host passes as its
+   * parameters (the event's data, as JSON).
+   */
+  private async bindParameters(
     declaration: Declaration,
     parameters: Record<string, unknown> | undefined,
     env: Environment,
-  ): void {
+  ): Promise<void> {
     if (declaration.kind === 'request') {
       if (parameters !== undefined && Object.keys(parameters).length > 0) {
         throw new ParameterError('A request script does not take parameters');
       }
       return;
     }
+    if (declaration.kind !== 'contract') return;
+
+    let declaredParameters: { name: string; type: RuntimeType }[] = declaration.parameters;
+    if (declaration.consumes) {
+      const event = await this.resolveEvent(declaration.consumes);
+      declaredParameters = event.fields.map((field) => ({ name: field.name, type: this.fieldType(event, field) }));
+    }
 
     const provided = parameters ?? {};
-    const declared = new Set(declaration.parameters.map((parameter) => parameter.name));
+    const declared = new Set(declaredParameters.map((parameter) => parameter.name));
     for (const key of Object.keys(provided)) {
       if (!declared.has(key)) throw new ParameterError(`Unknown parameter '${key}'`);
     }
-    for (const parameter of declaration.parameters) {
+    for (const parameter of declaredParameters) {
       if (env.lookup(parameter.name)?.builtin) {
         throw new ParameterError(`Parameter '${parameter.name}' conflicts with a built-in variable`);
       }
@@ -445,7 +517,33 @@ export class Interpreter {
       case 'exprStmt':
         await this.evaluate(statement.expression, env);
         return;
+      case 'emit':
+        return this.execEmit(statement, env);
     }
+  }
+
+  /** Checks an emit's arguments against the event's fields, and collects the event for the host. */
+  private async execEmit(statement: EmitStatement, env: Environment): Promise<void> {
+    const { line } = statement;
+    const event = await this.resolveEvent(statement.event, line);
+    const label = `${event.path}.${event.name}`;
+    const fields = new Set(event.fields.map((field) => field.name));
+    for (const arg of statement.args) {
+      if (!fields.has(arg.name)) {
+        throw new RuntimeError(`Event '${label}' has no field '${arg.name}'`, line);
+      }
+    }
+    const byName = new Map(statement.args.map((arg) => [arg.name, arg.value]));
+    const data: Record<string, unknown> = {};
+    for (const field of event.fields) {
+      const argExpr = byName.get(field.name);
+      if (argExpr === undefined) {
+        throw new RuntimeError(`Missing field '${field.name}' for event '${label}'`, line);
+      }
+      const value = requireData(await this.evaluate(argExpr, env), line);
+      data[field.name] = valueToJson(coerce(value, this.fieldType(event, field, line), `for field '${field.name}' of event '${label}'`, line));
+    }
+    this.emitted.push({ path: event.path, name: event.name, version: event.version, data });
   }
 
   private async execAssign(
@@ -875,6 +973,12 @@ export function valuesEqual(a: Value, b: Value): boolean {
   }
 }
 
+/** `path.Name` or `path.Name@version`. */
+export function eventLabel(ref: EventRef): string {
+  const name = [...ref.path, ref.name].join('.');
+  return ref.version === undefined ? name : `${name}@${ref.version}`;
+}
+
 /** Parses and executes a script in one call. */
 export async function interpret(source: string, options: InterpretOptions = {}): Promise<InterpretResult> {
   const script = parseScript(source);
@@ -889,6 +993,7 @@ export async function interpretParsed(script: Script, options: InterpretOptions 
     options.meter,
     options.signal,
     options.state,
+    options.events,
   );
   return interpreter.run(script, options.parameters, options.builtins);
 }

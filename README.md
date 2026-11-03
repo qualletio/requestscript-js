@@ -15,7 +15,7 @@ const result = await interpret(source, { resources, parameters });
 console.log(result.returnValue);
 ```
 
-Everything needed to build on the language is exported: `tokenize`, `parseScript`, the AST types, `Decimal`, the error classes, the `Resource` interfaces, [token metering](#token-metering) (`TokenMeter`, `maxTokens`), `compareVersions` for ordering contract versions, and the [state variable](#state-variables) store types with `encodeValue` and `decodeValue`.
+Everything needed to build on the language is exported: `tokenize`, `parseScript`, the AST types, `Decimal`, the error classes, the `Resource` interfaces, [token metering](#token-metering) (`TokenMeter`, `maxTokens`), `compareVersions` for ordering contract versions, the [state variable](#state-variables) store types with `encodeValue` and `decodeValue`, and the [event](#events) types with `emittedEvents`.
 
 The HTTP server lives behind the `requestscript-js/server` subpath:
 
@@ -107,7 +107,7 @@ Invoked with `{ "parameters": { "item": { "price": 9.99, "quantity": 2 }, "taxRa
 
 ### Scripts and declarations
 
-Every script is exactly one declaration followed by a `{ ... }` body. Nothing may come before or after it except comments.
+Every script is exactly one declaration followed by a `{ ... }` body, except an [event](#events) declaration, which has none. Nothing may come before or after it except comments.
 
 **Request** scripts are one-off and take no parameters:
 
@@ -216,6 +216,51 @@ await save(result.state); // [{ name, scope, value, type, version? }]
 ```
 
 `value` is `encodeValue`'s lossless JSON (it keeps `int64` and `decimal` exactly), and `type` is the variable's type, to store beside it. `version` is whatever the host's `get` returned, so it can refuse to save over a copy that changed during the run. Declaring a state variable without a store is a runtime error, so the HTTP server in `requestscript/server`, which has none, runs no contract that declares state.
+
+### Events
+
+An **event** declaration declares an event type: the fields its events carry. It is a script of its own, with no body:
+
+```
+event shop.OrderPlaced@1(orderId: string, total: decimal)
+restricted event shop.InternalAudit(entry: object)
+```
+
+The name, path and version work as for contracts, and the fields as parameters (a type without fields omits the parentheses). `restricted` is a flag for the host, which delivers a restricted event only to contracts deployed by the event's owner.
+
+A request or contract publishes an event with `emit`, naming every field:
+
+```
+contract shop.Checkout(orderId: string, total: decimal) {
+    emit shop.OrderPlaced(orderId: orderId, total: total)
+}
+```
+
+An **event contract** runs with each event of a type it `consumes`. It declares no parameters and no return type, since the event's fields are its parameters, and it can't return a value (a bare `return` ends it):
+
+```
+contract shop.OnOrderPlaced consumes shop.OrderPlaced@1 {
+    const log: com.example.Logger
+    log.info(message: "Order ${orderId}: ${total}")
+}
+```
+
+- `emit` names an event as `path.Name` or `path.Name@version`. Each field is converted to its type like a resource argument, and a missing or unknown field is a runtime error.
+- The interpreter doesn't publish anything. A host passes an `events` resolver to `interpret`, which looks up each event type, and the run returns its events in `result.events` (`[{ path, name, version, data }]`, with `data` as JSON). The host publishes them only if the run succeeded. Without a resolver, `emit` and running an event contract are runtime errors.
+- To run an event contract, the host passes the event's data as its `parameters`, which are checked against the event's fields.
+- `emittedEvents(script)` lists every event a script's `emit` statements name, for a host to check before it accepts the script.
+- `event`, `emit`, `consumes` and `restricted` aren't reserved words: they act as keywords only before a name, so they are still valid variable names.
+
+```ts
+import { interpret, type EventResolver } from "requestscript";
+
+const events: EventResolver = {
+  // Returns { path, name, version, fields: [{ name, type }] }, or undefined.
+  resolve: async (path, name, version) => lookup(path, name, version),
+};
+const result = await interpret(source, { events, parameters });
+await publish(result.events);
+```
 
 ### Expressions
 
