@@ -1,5 +1,6 @@
 export * from './ast.js';
 export { Decimal, DecimalArithmeticError } from './decimal.js';
+export { emittedEvents } from './events.js';
 export { LexError, ParameterError, ParseError, RequestScriptError, RuntimeError } from './errors.js';
 export {
   Interpreter,
@@ -8,6 +9,10 @@ export {
   interpret,
   interpretParsed,
   valuesEqual,
+  eventLabel,
+  type EmittedEvent,
+  type EventResolver,
+  type EventType,
   type InterpretOptions,
   type InterpretResult,
   type StateScope,

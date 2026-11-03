@@ -54,6 +54,8 @@ function statementMax(statement: Statement): number {
       return ifMax(statement);
     case 'exprStmt':
       return statement.tokens + expressionMax(statement.expression);
+    case 'emit':
+      return statement.tokens + statement.args.reduce((sum, arg) => sum + expressionMax(arg.value), 0);
   }
 }
 

@@ -33,9 +33,36 @@ export interface ContractDecl {
   parameters: ParameterDecl[];
   /** Declared with ': type' after the parameters. The contract's return value is checked against it. */
   returnType?: TypeNode;
+  /**
+   * Declared with `consumes path.Name[@version]` after the name: an event contract, which the host runs with
+   * each event of that type. It declares no parameters or return type; the event's fields are its parameters.
+   */
+  consumes?: EventRef;
 }
 
-export type Declaration = RequestDecl | ContractDecl;
+/** A reference to an event type: `path.Name`, optionally `@version`. */
+export interface EventRef {
+  path: string[];
+  name: string;
+  /** Omitted when the script doesn't pin one; the host picks the version. */
+  version?: string;
+}
+
+/**
+ * `event path.Name[@version](field: type, ...)`, optionally preceded by `restricted`: declares an event type,
+ * the data its events carry. It has no body. `restricted` asks the host to deliver its events only to
+ * contracts its owner deployed.
+ */
+export interface EventDecl {
+  kind: 'event';
+  path: string[];
+  name: string;
+  version: string;
+  fields: ParameterDecl[];
+  restricted: boolean;
+}
+
+export type Declaration = RequestDecl | ContractDecl | EventDecl;
 
 export interface Script {
   declaration: Declaration;
@@ -115,8 +142,21 @@ export interface ExpressionStatement {
   tokens: number;
 }
 
+/**
+ * `emit path.Name(field: value, ...)`: publishes an event. The run collects it in `InterpretResult.events`,
+ * and the host publishes the events of a run that succeeds.
+ */
+export interface EmitStatement {
+  kind: 'emit';
+  event: EventRef;
+  args: NamedArgument[];
+  line: number;
+  tokens: number;
+}
+
 export type Statement =
   | VarDeclStatement
+  | EmitStatement
   | ResourceDeclStatement
   | AssignStatement
   | ReturnStatement

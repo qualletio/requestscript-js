@@ -3,6 +3,9 @@ import type {
   BinaryExpr,
   BinaryOperator,
   ContractDecl,
+  EmitStatement,
+  EventDecl,
+  EventRef,
   Expression,
   IfBranch,
   IfStatement,
@@ -25,6 +28,8 @@ export class Parser {
   private pos = 0;
   /** What is being parsed, and how many blocks deep: state variables are only allowed at a contract's top level. */
   private declarationKind: 'request' | 'contract' | undefined;
+  /** Set while parsing an event contract's body, which can't return a value. */
+  private consumer = false;
   private depth = 0;
   /** Each node's full token span, children included, so a parent can work out the tokens it owns. */
   private readonly spans = new WeakMap<object, number>();
@@ -105,10 +110,54 @@ export class Parser {
     if (this.match('contract')) {
       this.declarationKind = 'contract';
       const declaration = this.parseContractDecl();
+      this.consumer = declaration.consumes !== undefined;
       const body = this.parseBlock();
       return { declaration, body };
     }
-    throw this.error(`A script must start with 'request' or 'contract'`);
+    if (this.atEventDecl()) {
+      return { declaration: this.parseEventDecl(), body: [] };
+    }
+    throw this.error(`A script must start with 'request', 'contract' or 'event'`);
+  }
+
+  /** `event` and `restricted` are not keywords: they start an event declaration only at the start of a script, before a name. */
+  private atEventDecl(): boolean {
+    const word = (offset: number, value: string) => this.peek(offset).type === 'identifier' && this.peek(offset).value === value;
+    return (word(0, 'event') && this.peek(1).type === 'identifier')
+      || (word(0, 'restricted') && word(1, 'event') && this.peek(2).type === 'identifier');
+  }
+
+  private parseEventDecl(): EventDecl {
+    const restricted = this.peek().value === 'restricted';
+    if (restricted) this.advance();
+    this.advance(); // event
+    const { path, name } = this.parsePath('event');
+    const version = this.match('@') ? this.parseContractVersion('event') : '1';
+    const fields: ParameterDecl[] = this.check('(') ? this.parseParameterList() : [];
+    if (this.check('{')) {
+      throw this.error('An event declares only its fields, so it has no body');
+    }
+    if (this.check(':')) {
+      throw this.error('An event has fields, not a return type');
+    }
+    return { kind: 'event', path, name, version, fields, restricted };
+  }
+
+  /** A dotted name such as `com.example.Name`: its path segments and its last segment. */
+  private parsePath(what: string): { path: string[]; name: string } {
+    const segments = [this.expectPathSegment(`as the ${what} name`)];
+    while (this.match('.')) {
+      segments.push(this.expectPathSegment(`in the ${what} path`));
+    }
+    const name = segments.pop()!;
+    return { path: segments, name };
+  }
+
+  /** `path.Name` or `path.Name@version`, naming an event type. */
+  private parseEventRef(): EventRef {
+    const { path, name } = this.parsePath('event');
+    if (!this.match('@')) return { path, name };
+    return { path, name, version: this.parseContractVersion('event') };
   }
 
   /** Contract path segments may be any word, including keywords (e.g. 'path.to.contract.Name'). */
@@ -122,12 +171,19 @@ export class Parser {
   }
 
   private parseContractDecl(): ContractDecl {
-    const segments = [this.expectPathSegment('as the contract name')];
-    while (this.match('.')) {
-      segments.push(this.expectPathSegment('in the contract path'));
-    }
-    const name = segments.pop()!;
+    const { path: segments, name } = this.parsePath('contract');
     const version = this.match('@') ? this.parseContractVersion() : '1';
+    if (this.check('identifier') && this.peek().value === 'consumes') {
+      this.advance();
+      const consumes = this.parseEventRef();
+      if (this.check('(')) {
+        throw this.error(`An event contract takes no parameters: the event's fields are its parameters`);
+      }
+      if (this.check(':')) {
+        throw this.error('An event contract has no return type');
+      }
+      return { kind: 'contract', path: segments, name, version, parameters: [], consumes };
+    }
     const parameters: ParameterDecl[] = this.check('(') ? this.parseParameterList() : [];
     const returnType = this.match(':') ? this.parseType() : undefined;
     return { kind: 'contract', path: segments, name, version, parameters, ...(returnType && { returnType }) };
@@ -139,11 +195,11 @@ export class Parser {
    * reassembled from consecutive tokens; adjacency is checked so that
    * whitespace does not silently join into one version.
    */
-  private parseContractVersion(): string {
+  private parseContractVersion(what = 'contract'): string {
     const numberToken = (): Token => {
       const token = this.peek();
       if (token.type !== 'int' && token.type !== 'decimal') {
-        throw this.error(`The contract version after '@' must be dot-separated numbers, e.g. '2' or '1.2.3'`, token);
+        throw this.error(`The ${what} version after '@' must be dot-separated numbers, e.g. '2' or '1.2.3'`, token);
       }
       return this.advance();
     };
@@ -156,7 +212,7 @@ export class Parser {
       previous = this.advance(); // '.'
       const next = this.peek();
       if (!adjacent(previous, next)) {
-        throw this.error(`The contract version must not contain spaces`, next);
+        throw this.error(`The ${what} version must not contain spaces`, next);
       }
       previous = numberToken();
       version += `.${previous.value}`;
@@ -267,6 +323,10 @@ export class Parser {
       case 'if':
         return this.parseIf();
       default:
+        // `emit` is not a keyword: it starts an emit statement only before a name, which no expression can.
+        if (token.type === 'identifier' && token.value === 'emit' && this.peek(1).type === 'identifier') {
+          return this.parseEmit();
+        }
         return this.parseAssignOrExpressionStatement();
     }
   }
@@ -333,6 +393,15 @@ export class Parser {
     );
   }
 
+  private parseEmit(): Statement {
+    const start = this.pos;
+    const keyword = this.advance(); // emit
+    const event = this.parseEventRef();
+    const args = this.parseCallArguments();
+    const statement: EmitStatement = { kind: 'emit', event, args, line: keyword.line, tokens: 0 };
+    return this.owned(statement, start, args.map((arg) => arg.value));
+  }
+
   private parseReturn(): Statement {
     const start = this.pos;
     const keyword = this.advance();
@@ -341,6 +410,9 @@ export class Parser {
     const next = this.peek();
     const hasValue = next.type !== '}' && next.type !== 'eof' && next.line === keyword.line;
     if (!hasValue) return this.owned({ kind: 'return', line: keyword.line, tokens: 0 }, start);
+    if (this.consumer) {
+      throw this.error('An event contract cannot return a value', keyword);
+    }
     const value = this.parseExpression();
     return this.owned({ kind: 'return', value, line: keyword.line, tokens: 0 }, start, [value]);
   }
