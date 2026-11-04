@@ -96,7 +96,7 @@ describe('events: parsing', () => {
   });
 
   it('still asks for a declaration first', () => {
-    expect(() => parseScript('foo { }')).toThrow("must start with 'request', 'contract' or 'event'");
+    expect(() => parseScript('foo { }')).toThrow("must start with 'request', 'contract', 'event' or 'struct'");
   });
 });
 

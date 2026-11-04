@@ -9,7 +9,19 @@ export type TypeNode =
   | { kind: 'string' }
   | { kind: 'object' }
   | { kind: 'decimal'; intDigits?: number; fracDigits?: number }
-  | { kind: 'list'; element: TypeNode };
+  | { kind: 'list'; element: TypeNode }
+  | StructRef;
+
+/**
+ * `path.Name@version` in a type: a struct the host declares (see `StructDecl`). The version is always written,
+ * so a struct type always means the same fields. The host resolves it with a `StructResolver`.
+ */
+export interface StructRef {
+  kind: 'struct';
+  path: string[];
+  name: string;
+  version: string;
+}
 
 export interface ParameterDecl {
   name: string;
@@ -62,7 +74,20 @@ export interface EventDecl {
   restricted: boolean;
 }
 
-export type Declaration = RequestDecl | ContractDecl | EventDecl;
+/**
+ * `struct path.Name@version(field: type, ...)`: declares a struct, a shape of object other types can name. It
+ * has no body, and must write its version. Values are checked against it structurally: each declared field is
+ * converted to its type, a missing one is null, and fields it doesn't declare are kept.
+ */
+export interface StructDecl {
+  kind: 'struct';
+  path: string[];
+  name: string;
+  version: string;
+  fields: ParameterDecl[];
+}
+
+export type Declaration = RequestDecl | ContractDecl | EventDecl | StructDecl;
 
 export interface Script {
   declaration: Declaration;
