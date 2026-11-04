@@ -7,12 +7,14 @@ import type {
   Expression,
   Script,
   Statement,
+  StructRef,
   VarDeclStatement,
 } from './ast.js';
 import { Decimal, DecimalArithmeticError } from './decimal.js';
 import { ParameterError, RuntimeError } from './errors.js';
 import { TokenMeter } from './meter.js';
 import { KEYWORDS } from './token.js';
+import { MAX_STRUCT_DEPTH, structLabel, structReferences, type StructResolver } from './structs.js';
 import { parseScript, parseTypeString } from './parser.js';
 import {
   resourceKey,
@@ -34,7 +36,8 @@ import {
   valueToHost,
   valueToJson,
   valueTypeName,
-  type RuntimeType
+  type ResolvedStruct,
+  type RuntimeType,
 } from './types.js';
 import {
   INT32_MAX,
@@ -128,6 +131,12 @@ export interface InterpretOptions {
    * `InterpretResult.events` for the host to publish.
    */
   events?: EventResolver;
+  /**
+   * The structs the script's types name, at the versions they name. The run resolves each struct a script's
+   * declaration and `var` types name before it starts, and those in resource and event types when it meets
+   * them. Without one, a struct type is a runtime error.
+   */
+  structs?: StructResolver;
 }
 
 /** An event type as the host knows it. Field types are type strings, as for resource functions. */
@@ -316,7 +325,11 @@ export class Interpreter {
     private readonly signal?: AbortSignal,
     private readonly stateStore?: StateStore,
     private readonly eventResolver?: EventResolver,
+    private readonly structResolver?: StructResolver,
   ) {}
+
+  /** The structs resolved in the current run, by label, each with every struct its fields name. */
+  private structs = new Map<string, ResolvedStruct>();
 
   /** The events emitted in the current run. */
   private emitted: EmittedEvent[] = [];
@@ -332,6 +345,14 @@ export class Interpreter {
     // Built-ins sit above the script's own scope, so no scope inside it can redeclare them.
     if (script.declaration.kind === 'event') {
       throw new RuntimeError('An event declaration declares an event type; it does not run');
+    }
+    if (script.declaration.kind === 'struct') {
+      throw new RuntimeError('A struct declaration declares a struct; it does not run');
+    }
+    this.structs = new Map();
+    // Every struct the script names is resolved before anything runs, so an unknown one fails the run early.
+    for (const ref of structReferences(script)) {
+      await this.resolveStruct(ref, []);
     }
     const root = new Environment(bindBuiltins(builtins ?? {}));
     await this.bindParameters(script.declaration, parameters, root);
@@ -349,7 +370,7 @@ export class Interpreter {
       }
     }
     if (script.declaration.kind === 'contract' && script.declaration.returnType) {
-      result = coerce(result, script.declaration.returnType, 'returned from the contract');
+      result = this.coerce(result, script.declaration.returnType, 'returned from the contract');
     }
     // In-place changes to lists and objects are in the bindings' values too.
     const state = this.stateBindings.map(({ name, scope, binding, version }): StateWrite => ({
@@ -378,11 +399,12 @@ export class Interpreter {
     if (stored) {
       const decoded = decodeValue(stored.value);
       type = statement.type ?? (JSON.parse(stored.type) as RuntimeType);
-      value = coerce(decoded, type, `in the stored value of state variable '${name}'`, line);
+      await this.resolveStructs(type, line);
+      value = this.coerce(decoded, type, `in the stored value of state variable '${name}'`, line);
     } else {
       value = requireData(await this.evaluate(statement.value, env), line);
       type = statement.type ?? inferType(value);
-      if (statement.type) value = coerce(value, statement.type, `in the declaration of '${name}'`, line);
+      if (statement.type) value = this.coerce(value, statement.type, `in the declaration of '${name}'`, line);
     }
     const binding: Binding = { value, type, constant: false };
     env.declare(name, binding, line);
@@ -402,13 +424,61 @@ export class Interpreter {
     return event;
   }
 
-  /** An event field's type, parsed from the host's type string. */
-  private fieldType(event: EventType, field: { name: string; type: string }, line?: number): RuntimeType {
+  /** An event field's type, parsed from the host's type string, with the structs it names resolved. */
+  private async fieldType(event: EventType, field: { name: string; type: string }, line?: number): Promise<RuntimeType> {
+    let type: RuntimeType;
     try {
-      return parseTypeString(field.type);
+      type = parseTypeString(field.type);
     } catch {
       throw new RuntimeError(`Event '${event.path}.${event.name}' declares an invalid type '${field.type}' for field '${field.name}'`, line);
     }
+    await this.resolveStructs(type, line);
+    return type;
+  }
+
+  /** Checks a value against a type, with the structs resolved in this run. */
+  private coerce(value: Value, type: RuntimeType, context: string, line?: number): Value {
+    return coerce(value, type, context, line, this.structs);
+  }
+
+  /** Resolves every struct a type names, and the structs their fields name, into `this.structs`. */
+  private async resolveStructs(type: RuntimeType, line?: number, chain: string[] = []): Promise<void> {
+    if (type.kind === 'list') return this.resolveStructs(type.element, line, chain);
+    if (type.kind === 'struct') return this.resolveStruct(type, chain, line);
+  }
+
+  /**
+   * Resolves a struct and, first, every struct its fields name. `chain` holds the structs whose fields led
+   * here, outermost first, to refuse a struct that contains itself and nesting beyond `MAX_STRUCT_DEPTH`.
+   */
+  private async resolveStruct(ref: Pick<StructRef, 'path' | 'name' | 'version'>, chain: string[], line?: number): Promise<void> {
+    const label = structLabel(ref);
+    if (this.structs.has(label)) return;
+    if (chain.includes(label)) {
+      const cycle = [...chain.slice(chain.indexOf(label)), label].join(' -> ');
+      throw new RuntimeError(`Struct '${label}' contains itself: ${cycle}`, line);
+    }
+    if (chain.length >= MAX_STRUCT_DEPTH) {
+      throw new RuntimeError(`Struct '${chain[0]}' nests more than ${MAX_STRUCT_DEPTH} structs deep`, line);
+    }
+    if (!this.structResolver) {
+      throw new RuntimeError(`Struct '${label}' needs a host that resolves structs`, line);
+    }
+    const struct = await this.structResolver.resolve(ref.path.join('.'), ref.name, ref.version);
+    if (!struct) {
+      throw new RuntimeError(`Unknown struct '${label}'`, line);
+    }
+    const fields = struct.fields.map((field) => {
+      try {
+        return { name: field.name, type: parseTypeString(field.type) as RuntimeType };
+      } catch {
+        throw new RuntimeError(`Struct '${label}' declares an invalid type '${field.type}' for field '${field.name}'`, line);
+      }
+    });
+    for (const field of fields) {
+      await this.resolveStructs(field.type, line, [...chain, label]);
+    }
+    this.structs.set(label, { label, fields });
   }
 
   /**
@@ -431,7 +501,10 @@ export class Interpreter {
     let declaredParameters: { name: string; type: RuntimeType }[] = declaration.parameters;
     if (declaration.consumes) {
       const event = await this.resolveEvent(declaration.consumes);
-      declaredParameters = event.fields.map((field) => ({ name: field.name, type: this.fieldType(event, field) }));
+      declaredParameters = [];
+      for (const field of event.fields) {
+        declaredParameters.push({ name: field.name, type: await this.fieldType(event, field) });
+      }
     }
 
     const provided = parameters ?? {};
@@ -446,7 +519,7 @@ export class Interpreter {
       if (!(parameter.name in provided)) {
         throw new ParameterError(`Missing parameter '${parameter.name}'`);
       }
-      const value = parameterToValue(provided[parameter.name], parameter.type, `for parameter '${parameter.name}'`);
+      const value = parameterToValue(provided[parameter.name], parameter.type, `for parameter '${parameter.name}'`, this.structs);
       env.declare(parameter.name, { value, type: parameter.type, constant: true });
     }
   }
@@ -471,7 +544,7 @@ export class Interpreter {
         const value = requireData(raw, statement.line);
         const type: RuntimeType = statement.type ?? inferType(value);
         const coerced = statement.type
-          ? coerce(value, statement.type, `in the declaration of '${statement.name}'`, statement.line)
+          ? this.coerce(value, statement.type, `in the declaration of '${statement.name}'`, statement.line)
           : value;
         env.declare(statement.name, { value: coerced, type, constant: statement.constant }, statement.line);
         return;
@@ -541,7 +614,8 @@ export class Interpreter {
         throw new RuntimeError(`Missing field '${field.name}' for event '${label}'`, line);
       }
       const value = requireData(await this.evaluate(argExpr, env), line);
-      data[field.name] = valueToJson(coerce(value, this.fieldType(event, field, line), `for field '${field.name}' of event '${label}'`, line));
+      const type = await this.fieldType(event, field, line);
+      data[field.name] = valueToJson(this.coerce(value, type, `for field '${field.name}' of event '${label}'`, line));
     }
     this.emitted.push({ path: event.path, name: event.name, version: event.version, data });
   }
@@ -563,7 +637,7 @@ export class Interpreter {
         if (binding.constant) {
           throw new RuntimeError(`Cannot assign to '${target.name}' because it is a const`, line);
         }
-        binding.value = coerce(value, binding.type, `in assignment to '${target.name}'`, line);
+        binding.value = this.coerce(value, binding.type, `in assignment to '${target.name}'`, line);
         return;
       }
       case 'member': {
@@ -746,11 +820,16 @@ export class Interpreter {
       if (argExpr === undefined) {
         throw new RuntimeError(`Missing argument '${parameter.name}' for function '${fn.name}'`, expression.line);
       }
-      const type = this.resourceType(parameter.type, `parameter '${parameter.name}' of function '${fn.name}'`, expression.line);
+      const type = await this.resourceType(parameter.type, `parameter '${parameter.name}' of function '${fn.name}'`, expression.line);
       const value = requireData(await this.evaluate(argExpr, env), expression.line);
-      const coerced = coerce(value, type, `for argument '${parameter.name}' of '${fn.name}'`, expression.line);
+      const coerced = this.coerce(value, type, `for argument '${parameter.name}' of '${fn.name}'`, expression.line);
       callParameters.push({ name: parameter.name, value: valueToHost(coerced) });
     }
+
+    // Resolved before the call, so a return type naming an unknown struct fails before the host does any work.
+    const returnType = fn.returnType === 'void'
+      ? undefined
+      : await this.resourceType(fn.returnType, `return type of function '${fn.name}'`, expression.line);
 
     this.signal?.throwIfAborted();
     let raw: unknown;
@@ -764,17 +843,20 @@ export class Interpreter {
     const result = toResourceResult(raw, fn.name, expression.line);
     if (result.error !== null) return resultValue(NULL_VALUE, result.error.message);
 
-    if (fn.returnType === 'void') return resultValue(NULL_VALUE, null);
-    const returnType = this.resourceType(fn.returnType, `return type of function '${fn.name}'`, expression.line);
-    return resultValue(hostToValue(result.value, returnType, `returned from '${fn.name}'`), null);
+    if (returnType === undefined) return resultValue(NULL_VALUE, null);
+    return resultValue(hostToValue(result.value, returnType, `returned from '${fn.name}'`, this.structs), null);
   }
 
-  private resourceType(type: string, what: string, line: number): RuntimeType {
+  /** A resource function's parameter or return type, parsed from its type string, with its structs resolved. */
+  private async resourceType(type: string, what: string, line: number): Promise<RuntimeType> {
+    let parsed: RuntimeType;
     try {
-      return parseTypeString(type);
+      parsed = parseTypeString(type);
     } catch {
       throw new RuntimeError(`Resource declares an invalid type '${type}' for ${what}`, line);
     }
+    await this.resolveStructs(parsed, line);
+    return parsed;
   }
 
   // ---------- operators ----------
@@ -994,6 +1076,7 @@ export async function interpretParsed(script: Script, options: InterpretOptions 
     options.signal,
     options.state,
     options.events,
+    options.structs,
   );
   return interpreter.run(script, options.parameters, options.builtins);
 }

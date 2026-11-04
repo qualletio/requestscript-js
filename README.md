@@ -107,7 +107,7 @@ Invoked with `{ "parameters": { "item": { "price": 9.99, "quantity": 2 }, "taxRa
 
 ### Scripts and declarations
 
-Every script is exactly one declaration followed by a `{ ... }` body, except an [event](#events) declaration, which has none. Nothing may come before or after it except comments.
+Every script is exactly one declaration followed by a `{ ... }` body, except an [event](#events) or [struct](#structs) declaration, which has none. Nothing may come before or after it except comments.
 
 **Request** scripts are one-off and take no parameters:
 
@@ -143,6 +143,7 @@ contract path.to.MyContract@1.2.3(name: string, tags: []string,) {
 | `string`        | Text                                                                   |                                                |
 | `object`        | String-keyed maps of any values                                        | Untyped; properties can hold any type.         |
 | `[]T`           | Lists of `T`                                                           | Nestable: `[][]int32`.                         |
+| `path.Name@v`   | Objects checked against a [struct](#structs)                           | The version is always written.                 |
 
 `null` is a value of every type: it can be assigned to any variable, parameter, or list element.
 
@@ -261,6 +262,49 @@ const events: EventResolver = {
 const result = await interpret(source, { events, parameters });
 await publish(result.events);
 ```
+
+### Structs
+
+A **struct** declaration names a shape of object: the fields it has and the type of each. It is a script of its own, with no body, and it must write its version:
+
+```
+struct shop.Address@1(street: string, zip: int32)
+struct shop.Customer@2(name: string, addresses: []shop.Address@1, credit: decimal)
+```
+
+The name, path and version work as for contracts, except that the version is required. The fields work as parameters and may be any type, including other structs and lists of them. A struct can't contain itself, directly or through other structs.
+
+A struct type is the struct's name and version, wherever a type can be written: parameters, return types, `var` and `const` annotations, state variables, event fields, and resource function type strings (`'shop.Address@1'`). A struct type without a version is an error, so a type always means the same fields.
+
+```
+contract shop.Ship(customer: shop.Customer@2): shop.Address@1 {
+    var home: shop.Address@1 = { street: "1 Main St", zip: 12345 }
+    return customer.addresses[0]
+}
+```
+
+A value is checked against a struct structurally, whenever it is converted to the struct's type, as by an assignment, a parameter or a return:
+
+- It must be an object, or `null`.
+- Each declared field is converted to its type, like an assignment, and a field that doesn't fit is a runtime error naming it.
+- A missing field is set to `null`, so no field is required.
+- Fields the struct doesn't declare are kept unchanged.
+- Any object with fitting fields fits, whatever struct it was built as. A struct value is an `object` and can be used as one.
+
+The interpreter doesn't store structs. A host passes a `structs` resolver to `interpret`, which looks up each struct by its path, name and exact version. Before a script runs, the run resolves every struct its declaration and `var` types name, and the structs their fields name, so an unknown struct fails the run before anything else happens. It resolves the structs in resource and event types when it first uses them. A struct that contains itself, or nests more than `MAX_STRUCT_DEPTH` (8) structs deep, is a runtime error. Without a resolver, any struct type is a runtime error.
+
+```ts
+import { createStructResolver, interpret, parseScript, structReferences, structType, type StructDecl } from "requestscript";
+
+// A host declares a struct from its source, and stores it as { path, name, version, fields: [{ name, type }] }.
+const declaration = parseScript("struct shop.Address@1(street: string, zip: int32)").declaration as StructDecl;
+const structs = createStructResolver([structType(declaration)]);
+
+const result = await interpret(source, { structs, parameters });
+```
+
+- `structReferences(script)` lists the structs a script names directly, for a host to check before it accepts the script. `typeStructReferences(type)` does the same for one parsed type.
+- `struct` isn't a reserved word: it acts as a keyword only at the start of a script, before a name.
 
 ### Expressions
 

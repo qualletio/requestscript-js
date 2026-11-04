@@ -29,7 +29,21 @@ export type RuntimeType =
   | { kind: 'string' }
   | { kind: 'object' }
   | { kind: 'decimal'; intDigits?: number; fracDigits?: number }
-  | { kind: 'list'; element: RuntimeType };
+  | { kind: 'list'; element: RuntimeType }
+  | { kind: 'struct'; path: string[]; name: string; version: string };
+
+/** A struct's fields with their types parsed, as values are checked against them. */
+export interface ResolvedStruct {
+  /** `path.Name@version`. */
+  label: string;
+  fields: { name: string; type: RuntimeType }[];
+}
+
+/**
+ * The structs a check may meet, by label (`path.Name@version`), with every struct their fields name. The
+ * interpreter builds it from the host's `StructResolver` before it checks a value.
+ */
+export type StructTable = ReadonlyMap<string, ResolvedStruct>;
 
 export const ANY_TYPE: RuntimeType = { kind: 'any' };
 
@@ -41,9 +55,23 @@ export function typeToString(type: RuntimeType | TypeNode): string {
       return type.intDigits !== undefined && type.fracDigits !== undefined
         ? `decimal(${type.intDigits}, ${type.fracDigits})`
         : 'decimal';
+    case 'struct':
+      return `${[...type.path, type.name].join('.')}@${type.version}`;
     default:
       return type.kind;
   }
+}
+
+/** The struct a type names, from the table; a runtime error when the interpreter didn't resolve it. */
+function lookupStruct(structs: StructTable | undefined, type: Extract<RuntimeType, { kind: 'struct' }>): ResolvedStruct {
+  const label = typeToString(type);
+  const struct = structs?.get(label);
+  if (!struct) throw new RuntimeError(`Unknown struct '${label}'`);
+  return struct;
+}
+
+function fieldContext(field: string, struct: ResolvedStruct, context: string): string {
+  return `for field '${field}' of ${struct.label} ${context}`;
 }
 
 /** A human-readable name for a value's runtime kind, for error messages. */
@@ -64,6 +92,7 @@ export function typesEqual(a: RuntimeType, b: RuntimeType): boolean {
   if (a.kind === 'decimal' && b.kind === 'decimal') {
     return a.intDigits === b.intDigits && a.fracDigits === b.fracDigits;
   }
+  if (a.kind === 'struct' && b.kind === 'struct') return typeToString(a) === typeToString(b);
   return true;
 }
 
@@ -113,8 +142,12 @@ function assignError(value: Value, type: RuntimeType, context: string, line?: nu
  * Checks a value against a type, applying the allowed numeric promotions
  * (int -> wider int, int -> decimal). Returns the possibly-converted value.
  * `null` is assignable to every type.
+ *
+ * A struct type takes an object: a copy of it with each declared field converted to its type, missing fields
+ * set to null, and the fields the struct doesn't declare kept as they are. `structs` must hold every struct
+ * the type names.
  */
-export function coerce(value: Value, type: RuntimeType, context: string, line?: number): Value {
+export function coerce(value: Value, type: RuntimeType, context: string, line?: number, structs?: StructTable): Value {
   if (type.kind === 'any') return value;
   if (value.kind === 'null') return value;
 
@@ -166,7 +199,26 @@ export function coerce(value: Value, type: RuntimeType, context: string, line?: 
       throw assignError(value, type, context, line);
     case 'list': {
       if (value.kind !== 'list') throw assignError(value, type, context, line);
-      return listValue(value.elements.map((element) => coerce(element, type.element, context, line)));
+      return listValue(value.elements.map((element) => coerce(element, type.element, context, line, structs)));
+    }
+    case 'struct': {
+      if (value.kind !== 'object') throw assignError(value, type, context, line);
+      let struct: ResolvedStruct;
+      try {
+        struct = lookupStruct(structs, type);
+      } catch (error) {
+        throw error instanceof RuntimeError ? new RuntimeError(error.message, line) : error;
+      }
+      const fields = new Map(struct.fields.map((field) => [field.name, field.type]));
+      const entries = new Map<string, Value>();
+      for (const [key, entry] of value.entries) {
+        const fieldType = fields.get(key);
+        entries.set(key, fieldType ? coerce(entry, fieldType, fieldContext(key, struct, context), line, structs) : entry);
+      }
+      for (const field of struct.fields) {
+        if (!entries.has(field.name)) entries.set(field.name, NULL_VALUE);
+      }
+      return objectValue(entries);
     }
   }
 }
@@ -234,7 +286,10 @@ export function valueToJson(value: Value): unknown {
 }
 
 class Converter {
-  constructor(private readonly errorClass: typeof RuntimeError) {}
+  constructor(
+    private readonly errorClass: typeof RuntimeError,
+    private readonly structs?: StructTable,
+  ) {}
 
   private fail(message: string): never {
     throw new this.errorClass(message);
@@ -295,6 +350,23 @@ class Converter {
       case 'list': {
         if (!Array.isArray(raw)) this.fail(`Expected a list ${context}, got ${describeRaw(raw)}`);
         return listValue(raw.map((element, index) => this.convert(element, type.element, `${context}[${index}]`)));
+      }
+      case 'struct': {
+        const label = typeToString(type);
+        if (typeof raw !== 'object' || Array.isArray(raw) || raw instanceof Decimal) {
+          this.fail(`Expected an object for ${label} ${context}, got ${describeRaw(raw)}`);
+        }
+        const struct = lookupStruct(this.structs, type);
+        const fields = new Map(struct.fields.map((field) => [field.name, field.type]));
+        const entries = new Map<string, Value>();
+        for (const [key, entry] of Object.entries(raw as Record<string, unknown>)) {
+          const fieldType = fields.get(key);
+          entries.set(key, fieldType ? this.convert(entry, fieldType, `${context}.${key}`) : this.infer(entry, `${context}.${key}`));
+        }
+        for (const field of struct.fields) {
+          if (!entries.has(field.name)) entries.set(field.name, NULL_VALUE);
+        }
+        return objectValue(entries);
       }
     }
   }
@@ -369,14 +441,20 @@ function describeRaw(raw: unknown): string {
   return `${type === 'undefined' ? 'undefined' : `a ${type}`}`;
 }
 
-/** Converts an incoming contract parameter (JSON) to a runtime value; failures are ParameterErrors. */
-export function parameterToValue(raw: unknown, type: RuntimeType, context: string): Value {
-  return new Converter(ParameterError).convert(raw, type, context);
+/**
+ * Converts an incoming contract parameter (JSON) to a runtime value; failures are ParameterErrors.
+ * `structs` must hold every struct the type names.
+ */
+export function parameterToValue(raw: unknown, type: RuntimeType, context: string, structs?: StructTable): Value {
+  return new Converter(ParameterError, structs).convert(raw, type, context);
 }
 
-/** Converts a host value (e.g. a resource function's return) to a runtime value. */
-export function hostToValue(raw: unknown, type: RuntimeType, context: string): Value {
-  return new Converter(RuntimeError).convert(raw, type, context);
+/**
+ * Converts a host value (e.g. a resource function's return) to a runtime value.
+ * `structs` must hold every struct the type names.
+ */
+export function hostToValue(raw: unknown, type: RuntimeType, context: string, structs?: StructTable): Value {
+  return new Converter(RuntimeError, structs).convert(raw, type, context);
 }
 
 /**

@@ -14,6 +14,8 @@ import type {
   ParameterDecl,
   Script,
   Statement,
+  StructDecl,
+  StructRef,
   TemplatePart,
   TypeNode,
   VarDeclStatement,
@@ -117,7 +119,45 @@ export class Parser {
     if (this.atEventDecl()) {
       return { declaration: this.parseEventDecl(), body: [] };
     }
-    throw this.error(`A script must start with 'request', 'contract' or 'event'`);
+    if (this.atStructDecl()) {
+      return { declaration: this.parseStructDecl(), body: [] };
+    }
+    throw this.error(`A script must start with 'request', 'contract', 'event' or 'struct'`);
+  }
+
+  /** `struct` is not a keyword: it starts a struct declaration only at the start of a script, before a name. */
+  private atStructDecl(): boolean {
+    return this.peek().type === 'identifier' && this.peek().value === 'struct' && this.peek(1).type === 'identifier';
+  }
+
+  private parseStructDecl(): StructDecl {
+    this.advance(); // struct
+    const { path, name } = this.parsePath('struct');
+    const label = [...path, name].join('.');
+    if (!this.match('@')) {
+      throw this.error(`A struct must declare its version, e.g. 'struct ${label}@1(...)'`);
+    }
+    const version = this.parseContractVersion('struct');
+    if (this.check('{')) {
+      throw this.error('A struct declares only its fields, so it has no body');
+    }
+    if (!this.check('(')) {
+      throw this.error(`A struct must declare its fields, e.g. 'struct ${label}@${version}(name: string)'`);
+    }
+    const fields = this.parseParameterList();
+    if (this.check('{')) {
+      throw this.error('A struct declares only its fields, so it has no body');
+    }
+    if (this.check(':')) {
+      throw this.error('A struct has fields, not a return type');
+    }
+    const self = `${label}@${version}`;
+    for (const field of fields) {
+      if (refersTo(field.type, self)) {
+        throw this.error(`Struct '${self}' can't refer to itself, as field '${field.name}' does`);
+      }
+    }
+    return { kind: 'struct', path, name, version, fields };
   }
 
   /** `event` and `restricted` are not keywords: they start an event declaration only at the start of a script, before a name. */
@@ -163,7 +203,7 @@ export class Parser {
   /** Contract path segments may be any word, including keywords (e.g. 'path.to.contract.Name'). */
   private expectPathSegment(context: string): string {
     const token = this.peek();
-    if (token.type === 'identifier' || /^[a-zA-Z_][a-zA-Z0-9_]*$/.test(token.value)) {
+    if (isPathWord(token)) {
       this.advance();
       return token.value;
     }
@@ -274,8 +314,33 @@ export class Parser {
         return { kind: 'decimal' };
       }
       default:
-        throw this.error(`Unknown type '${token.value}'`, token);
+        return this.parseStructType(token);
     }
+  }
+
+  /** `path.Name@version` after its first segment: a struct type, which must name its version. */
+  private parseStructType(first: Token): StructRef {
+    const segments = [first.value];
+    while (this.match('.')) {
+      segments.push(this.expectPathSegment('in the struct type'));
+    }
+    if (!this.match('@')) {
+      if (segments.length === 1) throw this.error(`Unknown type '${first.value}'`, first);
+      throw this.error(`Struct type '${segments.join('.')}' must name its version, e.g. '${segments.join('.')}@1'`, first);
+    }
+    const version = this.parseContractVersion('struct');
+    const name = segments.pop()!;
+    return { kind: 'struct', path: segments, name, version };
+  }
+
+  /**
+   * Whether the dotted name at the current token is followed by `@`, making it a struct type. Without one, a
+   * dotted name in a declaration's type is a resource reference.
+   */
+  private atStructType(): boolean {
+    let offset = 0;
+    while (this.peek(offset + 1).type === '.' && isPathWord(this.peek(offset + 2))) offset += 2;
+    return this.peek(offset + 1).type === '@';
   }
 
   private parseTypeDigits(what: string): number {
@@ -357,8 +422,8 @@ export class Parser {
 
     let type: TypeNode | undefined;
     if (this.match(':')) {
-      // A non-builtin dotted type name is a resource reference declaration.
-      if (this.check('identifier') && !BUILTIN_TYPE_NAMES.has(this.peek().value)) {
+      // A non-builtin dotted type name is a resource reference declaration, unless it names a struct version.
+      if (this.check('identifier') && !BUILTIN_TYPE_NAMES.has(this.peek().value) && !this.atStructType()) {
         if (state) {
           throw this.error(`A state variable can't hold a resource reference`, keyword);
         }
@@ -381,7 +446,13 @@ export class Parser {
       segments.push(this.expect('identifier', 'in the resource reference').value);
     }
     if (this.check('=')) {
-      throw this.error(`Unknown type '${segments.join('.')}'`, keyword);
+      const type = segments.join('.');
+      throw this.error(
+        segments.length > 1
+          ? `Unknown type '${type}': a struct type must name its version, e.g. '${type}@1'`
+          : `Unknown type '${type}'`,
+        keyword,
+      );
     }
     if (!constant) {
       throw this.error(`Resource references must be declared with 'const'`, keyword);
@@ -670,6 +741,17 @@ export class Parser {
     this.expect(']', 'to end the list');
     return this.owned({ kind: 'listLiteral', elements, line: start.line, tokens: 0 }, startPos, elements);
   }
+}
+
+/** Any word, keywords included, as a path segment may be. */
+function isPathWord(token: Token): boolean {
+  return token.type === 'identifier' || /^[a-zA-Z_][a-zA-Z0-9_]*$/.test(token.value);
+}
+
+/** Whether `type` names the struct `label` (`path.Name@version`), directly or as a list's element. */
+function refersTo(type: TypeNode, label: string): boolean {
+  if (type.kind === 'list') return refersTo(type.element, label);
+  return type.kind === 'struct' && `${[...type.path, type.name].join('.')}@${type.version}` === label;
 }
 
 /** Parses a complete Requestscript script from source text. */
