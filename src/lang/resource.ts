@@ -29,6 +29,12 @@ export interface Resource {
   /** Dotted path such as 'path.to'. */
   path: string;
   name: string;
+  /**
+   * The version of a versioned resource, such as one version of a deployed contract. A contract must bind a
+   * versioned resource by its version, `path.to.Name@version`, so the code it calls can't change under it.
+   * Leave it unset for a resource without versions, which scripts bind without one.
+   */
+  version?: string;
   functions: ResourceFunction[];
 }
 

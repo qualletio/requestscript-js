@@ -28,3 +28,10 @@ export class RuntimeError extends RequestScriptError {}
 
 /** Invalid parameters supplied when invoking a contract. */
 export class ParameterError extends RuntimeError {}
+
+/** A script failed on purpose, with `fail message`. `reason` is the message the script gave. */
+export class ScriptFailure extends RuntimeError {
+  constructor(readonly reason: string, line?: number) {
+    super(reason, line);
+  }
+}

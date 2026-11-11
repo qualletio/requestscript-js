@@ -11,7 +11,7 @@ export {
   type StructResolver,
   type StructType,
 } from './structs.js';
-export { LexError, ParameterError, ParseError, RequestScriptError, RuntimeError } from './errors.js';
+export { LexError, ParameterError, ParseError, RequestScriptError, RuntimeError, ScriptFailure } from './errors.js';
 export {
   Interpreter,
   createResourceResolver,
@@ -31,6 +31,9 @@ export {
   type StoredState,
   type ResourceResolver,
   type ResourceInvoker,
+  type CallAttachment,
+  type Payment,
+  MAX_PAYEES,
   defaultResourceInvoker,
 } from './interpreter.js';
 export { tokenize } from './lexer.js';

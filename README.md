@@ -130,6 +130,7 @@ contract path.to.MyContract@1.2.3(name: string, tags: []string,) {
 - Parameters are `name: type` pairs, separated by commas, with an optional trailing comma. Names must be unique. A parameterless contract omits the parentheses entirely; `()` is an error.
 - An optional return type follows the parameters after a colon: `contract shop.Total(items: []object): decimal { ... }`, or `contract shop.Count: int32 { ... }` without parameters. The value the contract returns is converted to that type like an assignment (`int32` widens to `decimal`, `null` is always allowed), and any other value is a runtime error. A contract without one may return anything.
 - Parameters are `const` bindings. When invoked, every declared parameter must be supplied, unknown parameters are rejected, and each value is converted to its declared type (see [JSON encoding](#json-encoding)). Supplying parameters to a `request` script is an error.
+- `payable` before `contract` makes a [payable contract](#money), which accepts money attached to a call. An event contract can't be payable.
 
 ### Types
 
@@ -181,6 +182,11 @@ request ClientId {
 - Their names are reserved: declaring a variable with a built-in's name, in any scope, is a runtime error, and so is a contract parameter with that name (a `ParameterError`).
 - Values are converted like resource results: numbers become `int32`, `int64` or `decimal`, and objects and lists convert recursively. A `null` built-in still reserves its name.
 - Names must be identifiers and not keywords; anything else throws a plain `Error`, since it is a host bug.
+
+Two built-ins come from the language rather than `builtins`, and are declared only when the host passes them (a payable contract always has `payment`):
+
+- **`now`**: the `now` option, as an `int64` of milliseconds since the Unix epoch. The interpreter never reads the clock itself, so a run that's given the same `now` runs the same way.
+- **`payment`**: see [Money](#money).
 
 ### State variables
 
@@ -369,6 +375,7 @@ There is no modulo operator, no compound assignment (`+=`), and no increment/dec
   ```
 
 - **`return`**: ends the script immediately. The value becomes the response's `returnValue`. A bare `return`, or reaching the end of the script without one, returns `null`.
+- **`fail`**: `fail "reason"` fails the run on purpose with a `ScriptFailure`, whose `reason` is the message. The message is any string expression, on the same line as `fail`. A host saves nothing of a run that fails. `fail` isn't a reserved word: it starts a statement only when its message follows.
 
 There are no loops or user-defined functions.
 
@@ -443,6 +450,49 @@ const addResource: Resource = {
 
 Pass resources to `interpret` with `resourceResolver: createResourceResolver([...])`, or to the server with the `resourceResolver` option of `startServer`/`createApp`.
 
+#### Versions
+
+A resource may be versioned, such as one version of a deployed contract: the host sets `version` on it. A script binds a version by writing it after `@`:
+
+```
+contract com.example.Market(jobId: string): object {
+    const job: com.example.Job@3
+    const weather: com.example.Weather
+    return job.run(jobId: jobId)
+}
+```
+
+- **Contracts pin versions.** A contract must name the version of every versioned resource it binds, so the code it calls can't change after it's deployed. Binding one without a version fails the run, and the error names the current version. Resources without versions are bound by name, as before.
+- **Requests may leave it off,** and get the current version.
+- **Versions must exist.** Naming a version the resource doesn't have, or naming one for a resource without versions, fails the run.
+- `const r: path.Name@1` without a value binds a resource; with `= value`, it declares a constant of the struct type `path.Name@1`.
+- Resolvers receive the version as `resolve(key, version)`. `createResourceResolver` accepts several versions of one resource, and returns the last one listed when no version is named. The interpreter checks the returned resource's `version`, so a resolver that ignores the version argument can't bind the wrong one.
+
+#### Money
+
+A call can attach money, in whole micro-USD (1 USD = 1,000,000), as options in braces between the function and its arguments. The interpreter checks it and hands it to the host's invoker; the host moves the money.
+
+```
+request Hire {
+    const job: com.example.Job@1
+    return job.run{amount: 20000000, payees: ["org_courier"]}(action: "fund").value
+}
+```
+
+- **Options:** `amount`, an integer from 0 to `Number.MAX_SAFE_INTEGER`; `payees`, a list of 1 to `MAX_PAYEES` (16) distinct organizations the money may be paid to; and in a contract, `from`, whose funding it comes from, and `key`, a string or `null`. A request script must name `payees` and can't name `from` or `key`; a contract must name `from`. These rules are checked when the script is parsed, and the values when the call runs, before anything is sent.
+- **Pinned versions:** a call that attaches money must bind its resource by version, `com.example.Job@1`, in a request script too, so the money pays for the code its payer read.
+- **The invoker** receives a fourth argument, a `CallAttachment` (`{ amount, payees?, from?, key? }`), only when the amount is more than 0. An amount of 0 attaches nothing, and the call is made as any other.
+- **Payable contracts** are declared with `payable contract ...`, and read the money attached to their call as the built-in `payment`: `{ amount: int64, from: string, payees: []string }`, from the host's `payment` option. Without one, `payment` is `{ amount: 0, from: null, payees: [] }`. A contract that isn't payable refuses a `payment` with an amount, and declares `payment` only when the host passes one, so existing contracts may keep using the name.
+
+```
+payable contract com.example.Tip(note: string): int64 {
+    if (payment.amount == 0) {
+        fail "attach a tip"
+    }
+    return payment.amount
+}
+```
+
 #### Custom invokers
 
 By default resources are run by `defaultResourceInvoker`, which calls `exec` and wraps the result. Pass `resourceInvoker` to `interpret` to run them some other way — over HTTP to another service, say. An invoker receives the resolved resource, the function name, and the coerced arguments, and returns the result object directly; the `resourceValue` and `resourceError` helpers build it:
@@ -502,6 +552,7 @@ Interpreter failures are thrown as typed errors, which the server maps to HTTP s
 - `LexError` and `ParseError` (HTTP `400`) cover malformed source: unknown characters, unterminated strings, unknown types, duplicate keys or parameters, a missing declaration, and so on. They carry a line and column.
 - `ParameterError` (HTTP `400`) is raised for missing, unknown, or wrongly-typed contract parameters.
 - `RuntimeError` (HTTP `422`) covers everything detected while running: type mismatches, unknown variables, redeclaration, assigning to a `const`, overflow, division by zero, out-of-bounds indexes, non-boolean conditions, and passing a meter's token limit (`TokenLimitError`). It carries a line number.
+- `ScriptFailure` (a `RuntimeError`, HTTP `422`) is a script failing on purpose with `fail`. Its `reason` is the script's message.
 
 A resource function failing is not one of these. It is reported to the script as `error` on the call's result, and the request still succeeds — see [Resources](#resources).
 

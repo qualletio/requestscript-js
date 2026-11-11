@@ -16,7 +16,8 @@ export type Value =
   | { kind: 'null' }
   | { kind: 'list'; elements: Value[]; readonly?: true }
   | { kind: 'object'; entries: Map<string, Value>; readonly?: true }
-  | { kind: 'resource'; resource: Resource };
+  /** `version` is the one the script wrote when it bound the resource, `const r: path.Name@version`. */
+  | { kind: 'resource'; resource: Resource; version?: string };
 
 export const NULL_VALUE: Value = { kind: 'null' };
 

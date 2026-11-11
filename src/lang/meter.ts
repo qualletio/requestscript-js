@@ -56,6 +56,8 @@ function statementMax(statement: Statement): number {
       return statement.tokens + expressionMax(statement.expression);
     case 'emit':
       return statement.tokens + statement.args.reduce((sum, arg) => sum + expressionMax(arg.value), 0);
+    case 'fail':
+      return statement.tokens + expressionMax(statement.message);
   }
 }
 
@@ -87,8 +89,11 @@ function childExpressions(expression: Expression): Expression[] {
       return [expression.object];
     case 'index':
       return [expression.object, expression.index];
-    case 'call':
-      return [expression.callee, ...expression.args.map((arg) => arg.value)];
+    case 'call': {
+      const options = expression.options;
+      const optionValues = options ? [options.amount, options.payees, options.from, options.key].filter((value): value is Expression => value !== undefined) : [];
+      return [expression.callee, ...optionValues, ...expression.args.map((arg) => arg.value)];
+    }
     case 'unary':
       return [expression.operand];
     case 'binary':

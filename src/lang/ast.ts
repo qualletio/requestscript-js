@@ -50,6 +50,11 @@ export interface ContractDecl {
    * each event of that type. It declares no parameters or return type; the event's fields are its parameters.
    */
   consumes?: EventRef;
+  /**
+   * Declared with `payable` before `contract`: the contract accepts money attached to a call, and reads it as
+   * the built-in `payment`. Set only when true. An event contract can't be payable, since nobody calls it.
+   */
+  payable?: true;
 }
 
 /** A reference to an event type: `path.Name`, optionally `@version`. */
@@ -117,12 +122,17 @@ export interface VarDeclStatement {
   tokens: number;
 }
 
-/** `const name: dotted.path.ResourceName` — binds a host resource. */
+/**
+ * `const name: dotted.path.ResourceName` or `const name: dotted.path.ResourceName@version` — binds a host
+ * resource. A contract must name the version of every versioned resource it binds (see `Resource.version`).
+ */
 export interface ResourceDeclStatement {
   kind: 'resourceDecl';
   name: string;
   resourcePath: string[];
   resourceName: string;
+  /** The version written after `@`, if any. */
+  version?: string;
   line: number;
   tokens: number;
 }
@@ -179,8 +189,20 @@ export interface EmitStatement {
   tokens: number;
 }
 
+/**
+ * `fail message`: fails the run on purpose, as a runtime error does. The host saves no state and publishes no
+ * events of a run that fails, and moves none of its money.
+ */
+export interface FailStatement {
+  kind: 'fail';
+  message: Expression;
+  line: number;
+  tokens: number;
+}
+
 export type Statement =
   | VarDeclStatement
+  | FailStatement
   | EmitStatement
   | ResourceDeclStatement
   | AssignStatement
@@ -276,11 +298,28 @@ export interface NamedArgument {
   value: Expression;
 }
 
-/** A resource function call: `resourceRef.fn(name: value, ...)`. */
+/**
+ * Money attached to a call, written in braces between the function and its arguments:
+ * `ref.fn{amount: ..., payees: [...]}(...)`. The interpreter checks the values and hands them to the host.
+ */
+export interface CallOptions {
+  /** Whole micro-USD, 0 or more. 0 attaches nothing. */
+  amount: Expression;
+  /** The organizations the money may be paid to. Required in a request script. */
+  payees?: Expression;
+  /** In a contract: whose funding the money comes from. Required there, and not allowed in a request script. */
+  from?: Expression;
+  /** In a contract: the key of the funding the money comes from, or null for funding never earmarked. */
+  key?: Expression;
+}
+
+/** A resource function call: `resourceRef.fn(name: value, ...)`, or `resourceRef.fn{options}(name: value, ...)`. */
 export interface CallExpr {
   kind: 'call';
   callee: MemberExpr;
   args: NamedArgument[];
+  /** Money attached to the call, when written. */
+  options?: CallOptions;
   line: number;
   tokens: number;
 }

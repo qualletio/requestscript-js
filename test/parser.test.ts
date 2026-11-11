@@ -132,6 +132,24 @@ describe('parser: statements', () => {
     expect(script.body[0]).toMatchObject({ kind: 'resourceDecl', resourcePath: [], resourceName: 'MyResource' });
   });
 
+  it('parses versioned resource reference declarations', () => {
+    const script = parseScript('request R { const job: com.example.Job@1.2 }');
+    expect(script.body[0]).toEqual({
+      kind: 'resourceDecl',
+      name: 'job',
+      resourcePath: ['com', 'example'],
+      resourceName: 'Job',
+      version: '1.2',
+      line: 1,
+      tokens: 10,
+    });
+  });
+
+  it('still parses a struct-typed constant with a value', () => {
+    const script = parseScript('request R { const a: com.example.Address@1 = null }');
+    expect(script.body[0]).toMatchObject({ kind: 'varDecl', type: { kind: 'struct', name: 'Address', version: '1' } });
+  });
+
   it('rejects resource references declared with var', () => {
     expect(() => parseScript('request R { var r: path.to.Res }')).toThrow(ParseError);
   });

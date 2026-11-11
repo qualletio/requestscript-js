@@ -1,6 +1,7 @@
 import type {
   BinaryExpr,
   CallExpr,
+  CallOptions,
   Declaration,
   EmitStatement,
   EventRef,
@@ -11,7 +12,7 @@ import type {
   VarDeclStatement,
 } from './ast.js';
 import { Decimal, DecimalArithmeticError } from './decimal.js';
-import { ParameterError, RuntimeError } from './errors.js';
+import { ParameterError, RuntimeError, ScriptFailure } from './errors.js';
 import { TokenMeter } from './meter.js';
 import { KEYWORDS } from './token.js';
 import { MAX_STRUCT_DEPTH, structLabel, structReferences, type StructResolver } from './structs.js';
@@ -57,35 +58,79 @@ import {
 } from './values.js';
 
 export interface ResourceResolver {
-  resolve(key: string): Promise<Resource | undefined>;
+  /**
+   * Looks a resource up by `path.Name`. With `version`, the script named that version: return the resource at
+   * that version, or undefined. Without it, return the current version. The interpreter checks the returned
+   * resource's `version` against the one the script wrote.
+   */
+  resolve(key: string, version?: string): Promise<Resource | undefined>;
 }
 
 export class DefaultResourceResolver implements ResourceResolver {
   constructor(private readonly resources: Map<string, Resource>) {}
 
-  async resolve(key: string): Promise<Resource | undefined> {
-    return this.resources.get(key);
+  async resolve(key: string, version?: string): Promise<Resource | undefined> {
+    const resource = this.resources.get(key);
+    return version === undefined || resource?.version === version ? resource : undefined;
   }
 }
 
-/** A resolver over a fixed list of resources. */
+/**
+ * A resolver over a fixed list of resources. Several versions of one resource may be listed; a lookup without
+ * a version returns the last one listed.
+ */
 export function createResourceResolver(resources: Resource[]): ResourceResolver {
-  const map = new Map(resources.map((resource) => [resourceKey(resource.path, resource.name), resource]));
+  const latest = new Map<string, Resource>();
+  const versioned = new Map<string, Resource>();
+  for (const resource of resources) {
+    const key = resourceKey(resource.path, resource.name);
+    latest.set(key, resource);
+    if (resource.version !== undefined) versioned.set(`${key}@${resource.version}`, resource);
+  }
   return {
-    resolve: async (key) => map.get(key) ?? undefined,
+    resolve: async (key, version) => (version === undefined ? latest.get(key) : versioned.get(`${key}@${version}`)),
   };
+}
+
+/** The most organizations money attached to a call may name as payees. */
+export const MAX_PAYEES = 16;
+
+/**
+ * Money a call attaches, `ref.fn{amount: ..., payees: [...]}(...)`, as the interpreter hands it to the host.
+ * The interpreter has checked it: `amount` is a whole number greater than 0 and at most
+ * `Number.MAX_SAFE_INTEGER`, `payees` names 1 to `MAX_PAYEES` distinct organizations, and the resource was bound
+ * by its version. A request script always names `payees` and never `from` or `key`; a contract always names `from`.
+ */
+export interface CallAttachment {
+  amount: number;
+  payees?: string[];
+  from?: string;
+  /** Null for funding that was never earmarked. Omitted when the script didn't write it. */
+  key?: string | null;
+}
+
+/** The money attached to the call that runs a contract, which a payable contract reads as the built-in `payment`. */
+export interface Payment {
+  /** Whole micro-USD, 0 when nothing was attached. */
+  amount: number | bigint;
+  /** The organization whose funding the amount carries, or null when nothing was attached. */
+  from: string | null;
+  /** The organizations the amount may be paid to. Empty when nothing was attached. */
+  payees: string[];
 }
 
 export interface ResourceInvoker {
   /**
    * Runs a resource function. Returning `{ value, error }` lets the script
    * handle the failure; throwing is also fine and is turned into the same
-   * shape with the thrown message.
+   * shape with the thrown message. `attachment` is the money the call attaches,
+   * passed only when it attaches more than 0.
    */
   invoke(
     resource: Resource,
     functionName: string,
     parameters: ResourceFunctionCallParameter[],
+    attachment?: CallAttachment,
   ): Promise<ResourceResult>;
 }
 
@@ -137,6 +182,17 @@ export interface InterpretOptions {
    * them. Without one, a struct type is a runtime error.
    */
   structs?: StructResolver;
+  /**
+   * The money attached to the call that runs a contract. A payable contract reads it as the built-in `payment`,
+   * which is `{ amount: 0, from: null, payees: [] }` without one. A contract that isn't payable refuses an amount
+   * greater than 0, and declares `payment` only when the host passes one.
+   */
+  payment?: Payment;
+  /**
+   * The time the script reads as the built-in `now`, in milliseconds since the Unix epoch, as an int64. Without
+   * it, `now` isn't declared: the interpreter never reads the clock itself, so a run replays the same way.
+   */
+  now?: number | bigint | Date;
 }
 
 /** An event type as the host knows it. Field types are type strings, as for resource functions. */
@@ -334,6 +390,9 @@ export class Interpreter {
   /** The events emitted in the current run. */
   private emitted: EmittedEvent[] = [];
 
+  /** Whether the current run is a contract's, which must bind versioned resources by their version. */
+  private inContract = false;
+
   /** The state variables declared in the current run, with their bindings, which hold their latest values. */
   private stateBindings: { name: string; scope: StateScope; binding: Binding; version?: unknown }[] = [];
 
@@ -341,6 +400,7 @@ export class Interpreter {
     script: Script,
     parameters?: Record<string, unknown>,
     builtins?: Record<string, unknown>,
+    context: { payment?: Payment | undefined; now?: number | bigint | Date | undefined } = {},
   ): Promise<InterpretResult> {
     // Built-ins sit above the script's own scope, so no scope inside it can redeclare them.
     if (script.declaration.kind === 'event') {
@@ -350,11 +410,14 @@ export class Interpreter {
       throw new RuntimeError('A struct declaration declares a struct; it does not run');
     }
     this.structs = new Map();
+    this.inContract = script.declaration.kind === 'contract';
     // Every struct the script names is resolved before anything runs, so an unknown one fails the run early.
     for (const ref of structReferences(script)) {
       await this.resolveStruct(ref, []);
     }
-    const root = new Environment(bindBuiltins(builtins ?? {}));
+    const builtinScope = bindBuiltins(builtins ?? {});
+    this.bindLanguageBuiltins(script, builtinScope, context);
+    const root = new Environment(builtinScope);
     await this.bindParameters(script.declaration, parameters, root);
     this.stateBindings = [];
     this.emitted = [];
@@ -381,6 +444,87 @@ export class Interpreter {
       ...(version === undefined ? {} : { version }),
     }));
     return { declaration: script.declaration, returnValue: valueToJson(result), usage: { tokens: this.meter.tokens }, state, events: this.emitted };
+  }
+
+  /**
+   * Declares `payment` for a payable contract, or for any contract the host passes one to, and `now` when the
+   * host passes it. A contract that isn't payable refuses money attached to its call.
+   */
+  private bindLanguageBuiltins(script: Script, scope: Environment, context: { payment?: Payment | undefined; now?: number | bigint | Date | undefined }): void {
+    const declaration = script.declaration;
+    const { payment, now } = context;
+    if (payment !== undefined) {
+      const amount = typeof payment.amount === 'bigint' ? payment.amount : Number.isSafeInteger(payment.amount) ? BigInt(payment.amount) : -1n;
+      if (amount < 0n || amount > BigInt(Number.MAX_SAFE_INTEGER)) {
+        throw new RuntimeError(`The amount attached to the call must be whole micro-USD from 0 to ${Number.MAX_SAFE_INTEGER}`);
+      }
+      if (amount > 0n && (declaration.kind !== 'contract' || !declaration.payable)) {
+        const name = declaration.kind === 'contract' ? [...declaration.path, declaration.name].join('.') : 'A request script';
+        throw new RuntimeError(`${name} isn't payable, so money can't be attached to a call to it`);
+      }
+    }
+    if (declaration.kind === 'contract' && (declaration.payable || payment !== undefined)) {
+      const { amount = 0, from = null, payees = [] } = payment ?? {};
+      const value = freezeValue(objectValue(new Map<string, Value>([
+        ['amount', int64Value(BigInt(amount))],
+        ['from', from === null ? NULL_VALUE : stringValue(from)],
+        ['payees', listValue(payees.map((payee) => stringValue(payee)))],
+      ])));
+      scope.declare('payment', { value, type: inferType(value), constant: true, builtin: true });
+    }
+    if (now !== undefined) {
+      const millis = now instanceof Date ? BigInt(now.getTime()) : BigInt(now);
+      scope.declare('now', { value: int64Value(millis), type: { kind: 'int64' }, constant: true, builtin: true });
+    }
+  }
+
+  /**
+   * The money a call attaches, checked, or undefined when it attaches nothing. Every option is evaluated, in
+   * the order written, even when the amount is 0.
+   */
+  private async callAttachment(options: CallOptions, target: Extract<Value, { kind: 'resource' }>, env: Environment, line: number): Promise<CallAttachment | undefined> {
+    const amountValue = requireData(await this.evaluate(options.amount, env), line);
+    if (amountValue.kind !== 'int32' && amountValue.kind !== 'int64') {
+      throw new RuntimeError(`The amount attached to a call must be an integer, not ${valueTypeName(amountValue)}`, line);
+    }
+    const amount = BigInt(amountValue.value);
+    if (amount < 0n || amount > BigInt(Number.MAX_SAFE_INTEGER)) {
+      throw new RuntimeError(`The amount attached to a call must be whole micro-USD from 0 to ${Number.MAX_SAFE_INTEGER}, not ${amount}`, line);
+    }
+    let payees: string[] | undefined;
+    if (options.payees) {
+      const value = requireData(await this.evaluate(options.payees, env), line);
+      if (value.kind !== 'list' || value.elements.some((element) => element.kind !== 'string' || element.value.length === 0)) {
+        throw new RuntimeError('payees must be a list of organizations, as non-empty strings', line);
+      }
+      payees = value.elements.map((element) => (element as { value: string }).value);
+      if (payees.length < 1 || payees.length > MAX_PAYEES || new Set(payees).size !== payees.length) {
+        throw new RuntimeError(`payees must name 1 to ${MAX_PAYEES} distinct organizations`, line);
+      }
+    }
+    let from: string | undefined;
+    if (options.from) {
+      const value = requireData(await this.evaluate(options.from, env), line);
+      if (value.kind !== 'string' || value.value.length === 0) {
+        throw new RuntimeError('from must name an organization, as a non-empty string', line);
+      }
+      from = value.value;
+    }
+    let key: string | null | undefined;
+    if (options.key) {
+      const value = requireData(await this.evaluate(options.key, env), line);
+      if (value.kind !== 'null' && (value.kind !== 'string' || value.value.length === 0)) {
+        throw new RuntimeError('key must be a non-empty string, or null', line);
+      }
+      key = value.kind === 'null' ? null : value.value;
+    }
+    if (amount === 0n) return undefined;
+    // The payer funds the code it read: never whatever its owner deploys next.
+    if (target.version === undefined) {
+      const key = resourceKey(target.resource.path, target.resource.name);
+      throw new RuntimeError(`A call that attaches money must name the version it pays: bind it as '${key}@<version>'`, line);
+    }
+    return { amount: Number(amount), ...(payees && { payees }), ...(from !== undefined && { from }), ...(key !== undefined && { key }) };
   }
 
   /**
@@ -552,11 +696,23 @@ export class Interpreter {
       case 'resourceDecl': {
         const path = statement.resourcePath.join('.');
         const key = resourceKey(path, statement.resourceName);
-        const resource = await this.resourceResolver.resolve(key);
-        if (!resource) {
-          throw new RuntimeError(`Unknown resource '${key}'`, statement.line);
+        const { version } = statement;
+        const resource = await this.resourceResolver.resolve(key, version);
+        // A resolver that ignores the version may answer with another one, which is as good as none.
+        if (!resource || (version !== undefined && resource.version !== undefined && resource.version !== version)) {
+          throw new RuntimeError(`Unknown resource '${version === undefined ? key : `${key}@${version}`}'`, statement.line);
         }
-        env.declare(statement.name, { value: { kind: 'resource', resource }, type: ANY_TYPE, constant: true }, statement.line);
+        if (version !== undefined && resource.version === undefined) {
+          throw new RuntimeError(`Resource '${key}' has no versions, so bind it without '@${version}'`, statement.line);
+        }
+        if (version === undefined && resource.version !== undefined && this.inContract) {
+          throw new RuntimeError(
+            `Resource '${key}' is versioned, so a contract must bind it by its version, e.g. '${key}@${resource.version}'`,
+            statement.line,
+          );
+        }
+        const value: Value = version === undefined ? { kind: 'resource', resource } : { kind: 'resource', resource, version };
+        env.declare(statement.name, { value, type: ANY_TYPE, constant: true }, statement.line);
         return;
       }
       case 'assign':
@@ -592,6 +748,13 @@ export class Interpreter {
         return;
       case 'emit':
         return this.execEmit(statement, env);
+      case 'fail': {
+        const message = requireData(await this.evaluate(statement.message, env), statement.line);
+        if (message.kind !== 'string') {
+          throw new RuntimeError(`fail needs a string message, not ${valueTypeName(message)}`, statement.line);
+        }
+        throw new ScriptFailure(message.value, statement.line);
+      }
     }
   }
 
@@ -806,6 +969,9 @@ export class Interpreter {
       );
     }
 
+    // Options are written before the arguments, so they're evaluated first.
+    const attachment = expression.options ? await this.callAttachment(expression.options, target, env, expression.line) : undefined;
+
     const declared = new Map(fn.parameters.map((parameter) => [parameter.name, parameter]));
     for (const arg of expression.args) {
       if (!declared.has(arg.name)) {
@@ -834,7 +1000,9 @@ export class Interpreter {
     this.signal?.throwIfAborted();
     let raw: unknown;
     try {
-      raw = await this.resourceInvoker.invoke(resource, fn.name, callParameters);
+      raw = attachment === undefined
+        ? await this.resourceInvoker.invoke(resource, fn.name, callParameters)
+        : await this.resourceInvoker.invoke(resource, fn.name, callParameters, attachment);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       return resultValue(NULL_VALUE, message);
@@ -1078,5 +1246,5 @@ export async function interpretParsed(script: Script, options: InterpretOptions 
     options.events,
     options.structs,
   );
-  return interpreter.run(script, options.parameters, options.builtins);
+  return interpreter.run(script, options.parameters, options.builtins, { payment: options.payment, now: options.now });
 }

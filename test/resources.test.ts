@@ -7,7 +7,7 @@ import {
   type ResourceInvoker,
 } from '../src/lang/interpreter.js';
 import { resourceError, type Resource, type ResourceFunctionCallParameter } from '../src/lang/resource.js';
-import { runBody } from './helpers.js';
+import { run, runBody } from './helpers.js';
 
 function arg(args: ResourceFunctionCallParameter[], name: string): unknown {
   return args.find((parameter) => parameter.name === name)?.value;
@@ -388,6 +388,57 @@ describe('interpreter: resource invoker', () => {
   it('defaultResourceInvoker rejects unknown functions', async () => {
     await expect(defaultResourceInvoker.invoke(addResource, 'subtract', [])).rejects.toThrow(
       /Resource 'path.to.AddResource' has no function 'subtract'/,
+    );
+  });
+});
+
+describe('interpreter: resource versions', () => {
+  const job = (version: string, answer: number): Resource => ({
+    metadata: {},
+    path: 'com.example',
+    name: 'Job',
+    version,
+    functions: [{ name: 'run', parameters: [], exec: async () => answer, returnType: 'int32' }],
+  });
+  const resourceResolver = createResourceResolver([job('1', 10), job('2', 20), addResource]);
+  const contract = (body: string) => `contract com.example.Caller: object {\n${body}\n}`;
+
+  it('binds the version a script names', async () => {
+    expect(await runBody('const j: com.example.Job@1\nreturn j.run()', { resourceResolver })).toEqual(ok(10));
+    expect(await run(contract('const j: com.example.Job@1\nreturn j.run()'), { resourceResolver })).toEqual(ok(10));
+  });
+
+  it('binds the latest version in a request that names none', async () => {
+    expect(await runBody('const j: com.example.Job\nreturn j.run()', { resourceResolver })).toEqual(ok(20));
+  });
+
+  it('makes a contract name the version of a versioned resource', async () => {
+    await expect(run(contract('const j: com.example.Job\nreturn j.run()'), { resourceResolver })).rejects.toThrow(
+      "Resource 'com.example.Job' is versioned, so a contract must bind it by its version, e.g. 'com.example.Job@2'",
+    );
+  });
+
+  it('lets a contract bind a resource without versions by its name', async () => {
+    expect(await run(contract('const r: path.to.AddResource\nreturn r.add(first: 1, second: 2)'), { resourceResolver })).toEqual(ok(3));
+  });
+
+  it('refuses a version a resource does not have', async () => {
+    await expect(runBody('const j: com.example.Job@3\nreturn 1', { resourceResolver })).rejects.toThrow(
+      "Unknown resource 'com.example.Job@3'",
+    );
+  });
+
+  it('refuses a version for a resource without versions', async () => {
+    const unversioned = { resolve: async () => addResource };
+    await expect(runBody('const r: path.to.AddResource@1\nreturn 1', { resourceResolver: unversioned })).rejects.toThrow(
+      "Resource 'path.to.AddResource' has no versions, so bind it without '@1'",
+    );
+  });
+
+  it('refuses another version from a resolver that ignores the version', async () => {
+    const ignoring = { resolve: async () => job('2', 20) };
+    await expect(runBody('const j: com.example.Job@1\nreturn 1', { resourceResolver: ignoring })).rejects.toThrow(
+      "Unknown resource 'com.example.Job@1'",
     );
   });
 });

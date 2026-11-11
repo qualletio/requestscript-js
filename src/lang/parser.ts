@@ -1,4 +1,6 @@
 import type {
+  CallOptions,
+  FailStatement,
   AssignStatement,
   BinaryExpr,
   BinaryOperator,
@@ -109,10 +111,19 @@ export class Parser {
       const body = this.parseBlock();
       return { declaration: { kind: 'request', name }, body };
     }
+    // `payable` is not a keyword: it marks a contract only at the start of a script, before `contract`.
+    const payable = this.peek().type === 'identifier' && this.peek().value === 'payable' && this.peek(1).type === 'contract';
+    if (payable) this.advance();
     if (this.match('contract')) {
       this.declarationKind = 'contract';
       const declaration = this.parseContractDecl();
       this.consumer = declaration.consumes !== undefined;
+      if (payable) {
+        if (this.consumer) {
+          throw this.error('An event contract can\'t be payable: nobody calls it, so nobody can attach money');
+        }
+        declaration.payable = true;
+      }
       const body = this.parseBlock();
       return { declaration, body };
     }
@@ -392,6 +403,9 @@ export class Parser {
         if (token.type === 'identifier' && token.value === 'emit' && this.peek(1).type === 'identifier') {
           return this.parseEmit();
         }
+        if (this.atFail()) {
+          return this.parseFail();
+        }
         return this.parseAssignOrExpressionStatement();
     }
   }
@@ -430,6 +444,13 @@ export class Parser {
         return this.parseResourceDecl(constant, name, keyword, start);
       }
       type = this.parseType();
+      // `const r: path.Name@version` with no value binds a version of a resource, not a struct-typed constant.
+      if (type.kind === 'struct' && type.path.length > 0 && constant && !this.check('=')) {
+        return this.owned(
+          { kind: 'resourceDecl', name, resourcePath: type.path, resourceName: type.name, version: type.version, line: keyword.line, tokens: 0 },
+          start,
+        );
+      }
     }
 
     this.expect('=', `after the ${constant ? 'const' : 'var'} declaration of '${name}'`);
@@ -471,6 +492,25 @@ export class Parser {
     const args = this.parseCallArguments();
     const statement: EmitStatement = { kind: 'emit', event, args, line: keyword.line, tokens: 0 };
     return this.owned(statement, start, args.map((arg) => arg.value));
+  }
+
+  /**
+   * `fail` is not a keyword: it starts a fail statement only when its message follows on the same line, starting
+   * with a string, a name, a number or a parenthesis, which no expression starting with `fail` can.
+   */
+  private atFail(): boolean {
+    const token = this.peek();
+    const next = this.peek(1);
+    return token.type === 'identifier' && token.value === 'fail' && next.line === token.line
+      && (next.type === 'string' || next.type === 'identifier' || next.type === 'int' || next.type === '(');
+  }
+
+  private parseFail(): Statement {
+    const start = this.pos;
+    const keyword = this.advance(); // fail
+    const message = this.parseExpression();
+    const statement: FailStatement = { kind: 'fail', message, line: keyword.line, tokens: 0 };
+    return this.owned(statement, start, [message]);
   }
 
   private parseReturn(): Statement {
@@ -617,10 +657,65 @@ export class Parser {
         const args = this.parseCallArguments();
         const children = [expression, ...args.map((arg) => arg.value)];
         expression = this.owned({ kind: 'call', callee: expression as MemberExpr, args, line: token.line, tokens: 0 }, start, children);
+      } else if (expression.kind === 'member' && this.atCallOptions(token)) {
+        const options = this.parseCallOptions();
+        if (!this.check('(')) {
+          throw this.error('Call options must be followed by the call\'s arguments in parentheses');
+        }
+        const args = this.parseCallArguments();
+        const optionValues = [options.amount, options.payees, options.from, options.key].filter((value): value is Expression => value !== undefined);
+        const children = [expression, ...optionValues, ...args.map((arg) => arg.value)];
+        expression = this.owned({ kind: 'call', callee: expression as MemberExpr, args, options, line: token.line, tokens: 0 }, start, children);
       } else {
         return expression;
       }
     }
+  }
+
+  /** `{` on the line of the function name, starting `name:`, so it can't be a block or an object on its own line. */
+  private atCallOptions(token: Token): boolean {
+    return this.check('{') && this.peek().line === token.line && this.peek(1).type === 'identifier' && this.peek(2).type === ':';
+  }
+
+  /** `{amount: ..., payees: ..., from: ..., key: ...}`, before a call's arguments: money attached to the call. */
+  private parseCallOptions(): CallOptions {
+    const open = this.expect('{', 'to start the call options');
+    const values = new Map<string, Expression>();
+    while (!this.check('}')) {
+      const nameToken = this.expect('identifier', 'as a call option');
+      if (!['amount', 'payees', 'from', 'key'].includes(nameToken.value)) {
+        throw this.error(`Unknown call option '${nameToken.value}': a call takes amount, payees, from and key`, nameToken);
+      }
+      if (values.has(nameToken.value)) {
+        throw this.error(`Duplicate call option '${nameToken.value}'`, nameToken);
+      }
+      this.expect(':', 'after the call option');
+      values.set(nameToken.value, this.parseExpression());
+      if (!this.match(',')) break;
+    }
+    this.expect('}', 'to end the call options');
+    const amount = values.get('amount');
+    if (!amount) {
+      throw this.error('Call options attach money, so they need an amount', open);
+    }
+    if (this.declarationKind === 'contract') {
+      if (!values.has('from')) {
+        throw this.error('A contract names whose funding it attaches, with from', open);
+      }
+    } else {
+      if (values.has('from') || values.has('key')) {
+        throw this.error('A request script\'s money comes from its run\'s organization, so it names no from or key', open);
+      }
+      if (!values.has('payees')) {
+        throw this.error('A request script that attaches money names the organizations it may be paid to, with payees', open);
+      }
+    }
+    const options: CallOptions = { amount };
+    for (const name of ['payees', 'from', 'key'] as const) {
+      const value = values.get(name);
+      if (value) options[name] = value;
+    }
+    return options;
   }
 
   private parseCallArguments(): NamedArgument[] {
