@@ -50,9 +50,18 @@ docker compose up -d          # Postgres (set POSTGRES_PORT to override the host
 pnpm dev                      # migrates the database, then serves on http://localhost:3000
 pnpm test                     # full test suite (uses embedded PGlite, no Docker needed)
 pnpm build                    # compiles to dist/ (also run automatically on pack/publish)
+pnpm conformance              # the deterministic conformance suite (see below)
 ```
 
 Configuration is via environment variables: `DATABASE_URL` (defaults to `postgres://requestscript:requestscript@localhost:5432/requestscript`) and `PORT` (defaults to `3000`). Migrations live in `./drizzle`, are generated with `pnpm db:generate`, and are applied automatically on server start (or manually with `pnpm db:migrate`).
+
+### Deterministic conformance
+
+Every release must run scripts exactly as earlier releases did, since a host may replay a run on another version and treat any difference as the original host having lied (Stellarium's operator does, for payable contracts). The conformance suite pins that down: `src/conformance/cases.ts` holds scripts with fixed inputs (parameters, `payment`, `now`, built-ins, recorded resource responses, stored state, event types and structs) and the exact outputs each must produce. Those outputs are the return value as JSON (key order included), the error and its message, the tokens metered, every resource call with its arguments and attached money, the state writes and the events.
+
+- `pnpm publish` runs it (`prepublishOnly`), so a release that changes any output isn't published.
+- Cases are only ever added. A change that alters a case's expected output changes how deployed scripts run, and needs a new major version, never an edited case.
+- Anyone can check an installed version: `npx requestscript-conformance` exits 1 on any difference, and `runConformance()` from `requestscript/conformance` returns the failures.
 
 ## HTTP API
 
