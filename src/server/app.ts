@@ -143,11 +143,17 @@ export function createApp(options: AppOptions): Express {
         sendError(res, 400, 'InvalidBody', `The 'parameters' key must be a JSON object`);
         return;
       }
+      const fn = (body as Record<string, unknown>)['function'];
+      if (fn !== undefined && typeof fn !== 'string') {
+        sendError(res, 400, 'InvalidBody', `The 'function' key must name one of the contract's pub functions`);
+        return;
+      }
 
       try {
         const result = await interpret(row.source, {
           resourceResolver,
           parameters: parameters as Record<string, unknown>,
+          ...(fn === undefined ? {} : { function: fn }),
         });
         res.json({ returnValue: result.returnValue ?? null });
       } catch (error) {
@@ -168,7 +174,7 @@ export function createApp(options: AppOptions): Express {
           sendError(res, 400, 'InvalidScript', 'POST /contracts saves contract scripts; run request scripts via POST /run');
           return;
         }
-        const saved = await saveContract(db, script.declaration, source);
+        const saved = await saveContract(db, { ...script, declaration: script.declaration }, source);
         if (!saved.created) {
           const label = contractLabel({ path: saved.path, name: saved.name, version: saved.version });
           sendError(
@@ -183,7 +189,7 @@ export function createApp(options: AppOptions): Express {
           path: saved.path,
           name: saved.name,
           version: saved.version,
-          parameters: saved.parameters,
+          functions: saved.functions,
         });
       } catch (error) {
         sendScriptError(res, error);
@@ -201,7 +207,7 @@ export function createApp(options: AppOptions): Express {
           path: row.path,
           name: row.name,
           version: row.version,
-          parameters: row.parameters,
+          functions: row.functions,
         })),
       });
     }),

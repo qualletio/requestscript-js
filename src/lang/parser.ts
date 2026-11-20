@@ -9,6 +9,8 @@ import type {
   EventDecl,
   EventRef,
   Expression,
+  FnCallExpr,
+  FunctionDecl,
   IfBranch,
   IfStatement,
   MemberExpr,
@@ -23,7 +25,9 @@ import type {
   VarDeclStatement,
 } from './ast.js';
 import { ParseError } from './errors.js';
+import { EVENT_HANDLER } from './functions.js';
 import { tokenize } from './lexer.js';
+import { typeToString } from './types.js';
 import type { Token, TokenType } from './token.js';
 
 const BUILTIN_TYPE_NAMES = new Set(['int32', 'int64', 'decimal', 'boolean', 'string', 'object']);
@@ -32,9 +36,13 @@ export class Parser {
   private pos = 0;
   /** What is being parsed, and how many blocks deep: state variables are only allowed at a contract's top level. */
   private declarationKind: 'request' | 'contract' | undefined;
-  /** Set while parsing an event contract's body, which can't return a value. */
+  /** Set while parsing an event contract's body. */
   private consumer = false;
   private depth = 0;
+  /** The function whose body is being parsed, if any: a function without a return type can't return a value. */
+  private currentFunction: FunctionDecl | undefined;
+  /** Every call to one of the contract's functions, with the function it is in, resolved once all are parsed. */
+  private fnCalls: { call: FnCallExpr; caller: FunctionDecl | undefined }[] = [];
   /** Each node's full token span, children included, so a parent can work out the tokens it owns. */
   private readonly spans = new WeakMap<object, number>();
 
@@ -109,29 +117,27 @@ export class Parser {
       this.declarationKind = 'request';
       const name = this.expect('identifier', 'as the request name').value;
       const body = this.parseBlock();
-      return { declaration: { kind: 'request', name }, body };
+      if (this.fnCalls.length > 0) {
+        const { call } = this.fnCalls[0]!;
+        throw new ParseError(`A request script has no functions, so '${call.name}(...)' can't be called`, call.line);
+      }
+      return { declaration: { kind: 'request', name }, body, functions: [] };
     }
-    // `payable` is not a keyword: it marks a contract only at the start of a script, before `contract`.
-    const payable = this.peek().type === 'identifier' && this.peek().value === 'payable' && this.peek(1).type === 'contract';
-    if (payable) this.advance();
+    if (this.peek().type === 'identifier' && this.peek().value === 'payable' && this.peek(1).type === 'contract') {
+      throw this.error(`'payable' marks a contract's functions now, not the contract: write 'pub payable fn name(...)' inside it`);
+    }
     if (this.match('contract')) {
       this.declarationKind = 'contract';
       const declaration = this.parseContractDecl();
       this.consumer = declaration.consumes !== undefined;
-      if (payable) {
-        if (this.consumer) {
-          throw this.error('An event contract can\'t be payable: nobody calls it, so nobody can attach money');
-        }
-        declaration.payable = true;
-      }
-      const body = this.parseBlock();
-      return { declaration, body };
+      const { body, functions } = this.parseContractBody(declaration);
+      return { declaration, body, functions };
     }
     if (this.atEventDecl()) {
-      return { declaration: this.parseEventDecl(), body: [] };
+      return { declaration: this.parseEventDecl(), body: [], functions: [] };
     }
     if (this.atStructDecl()) {
-      return { declaration: this.parseStructDecl(), body: [] };
+      return { declaration: this.parseStructDecl(), body: [], functions: [] };
     }
     throw this.error(`A script must start with 'request', 'contract', 'event' or 'struct'`);
   }
@@ -227,17 +233,191 @@ export class Parser {
     if (this.check('identifier') && this.peek().value === 'consumes') {
       this.advance();
       const consumes = this.parseEventRef();
-      if (this.check('(')) {
-        throw this.error(`An event contract takes no parameters: the event's fields are its parameters`);
+      if (this.check('(') || this.check(':')) {
+        throw this.error(`An event contract's handler takes the event's fields: declare 'fn ${EVENT_HANDLER}(field: type, ...)' inside it`);
       }
-      if (this.check(':')) {
-        throw this.error('An event contract has no return type');
-      }
-      return { kind: 'contract', path: segments, name, version, parameters: [], consumes };
+      return { kind: 'contract', path: segments, name, version, consumes };
     }
-    const parameters: ParameterDecl[] = this.check('(') ? this.parseParameterList() : [];
+    if (this.check('(')) {
+      throw this.error(`A contract's parameters belong to its functions now: declare 'pub fn name(parameter: type, ...)' inside it`);
+    }
+    if (this.check(':')) {
+      throw this.error(`A contract's return type belongs to its functions now: declare 'pub fn name(): type' inside it`);
+    }
+    return { kind: 'contract', path: segments, name, version };
+  }
+
+  /**
+   * `{ ... }` after a contract's declaration: its `var state` variables, `const` resource bindings and
+   * functions, in any order. Nothing else may appear outside a function.
+   */
+  private parseContractBody(declaration: ContractDecl): { body: Statement[]; functions: FunctionDecl[] } {
+    this.expect('{', 'to start the contract body');
+    this.depth++;
+    const body: Statement[] = [];
+    const functions: FunctionDecl[] = [];
+    while (!this.check('}')) {
+      const token = this.peek();
+      if (token.type === 'eof') throw this.error(`Expected '}' to close the contract body`);
+      if (this.atFunction()) {
+        const fn = this.parseFunction();
+        if (functions.some((other) => other.name === fn.name)) {
+          throw new ParseError(`Duplicate function '${fn.name}'`, fn.line);
+        }
+        functions.push(fn);
+        continue;
+      }
+      if (token.type === 'var' || token.type === 'const') {
+        const statement = this.parseVarDecl(token.type === 'const');
+        if (statement.kind === 'resourceDecl' || (statement.kind === 'varDecl' && statement.state)) {
+          body.push(statement);
+          continue;
+        }
+      }
+      throw new ParseError(
+        `Outside its functions a contract declares only state variables ('var state'), resource bindings ('const r: path.Name@version') and functions ('fn')`,
+        token.line,
+        token.column,
+      );
+    }
+    this.expect('}', 'to end the contract body');
+    this.depth--;
+    this.checkFunctions(declaration, body, functions);
+    return { body, functions };
+  }
+
+  /** `fn`, `pub fn`, `pub payable fn`, or `payable fn`, which is refused when parsed. */
+  private atFunction(): boolean {
+    const payable = (offset: number) => this.peek(offset).type === 'identifier' && this.peek(offset).value === 'payable';
+    return this.check('fn') || this.check('pub') || (payable(0) && (this.peek(1).type === 'fn' || this.peek(1).type === 'pub'));
+  }
+
+  private parseFunction(): FunctionDecl {
+    const first = this.peek();
+    if (first.type === 'identifier') {
+      throw this.error(`Only a pub function can be payable, and 'pub' comes first: 'pub payable fn'`);
+    }
+    const pub = this.match('pub') !== undefined;
+    let payable = false;
+    if (pub && this.check('identifier') && this.peek().value === 'payable') {
+      this.advance();
+      payable = true;
+    }
+    this.expect('fn', pub ? `after '${payable ? 'pub payable' : 'pub'}'` : 'to declare a function');
+    const name = this.expect('identifier', 'as the function name').value;
+    const parameters = this.check('(')
+      ? this.parseParameterList(true)
+      : (() => { throw this.error(`Function '${name}' needs a parameter list, e.g. '${name}()'`); })();
     const returnType = this.match(':') ? this.parseType() : undefined;
-    return { kind: 'contract', path: segments, name, version, parameters, ...(returnType && { returnType }) };
+    const fn: FunctionDecl = { name, pub, payable, parameters, body: [], line: first.line };
+    if (returnType) fn.returnType = returnType;
+    this.currentFunction = fn;
+    fn.body = this.parseBlock();
+    this.currentFunction = undefined;
+    return fn;
+  }
+
+  /**
+   * The rules that need the whole contract: its entrypoints, the names its functions' parameters may take,
+   * and every call to its functions, which must name one, pass its parameters, and never lead back to itself.
+   */
+  private checkFunctions(declaration: ContractDecl, body: Statement[], functions: FunctionDecl[]): void {
+    const label = [...declaration.path, declaration.name].join('.');
+    const handler = functions.find((fn) => fn.name === EVENT_HANDLER);
+    if (declaration.consumes) {
+      if (!handler) {
+        throw this.error(`Event contract '${label}' needs a handler: 'fn ${EVENT_HANDLER}(field: type, ...) { ... }'`);
+      }
+      if (handler.pub) {
+        throw new ParseError(`The handler '${EVENT_HANDLER}' runs with each event, so it isn't pub`, handler.line);
+      }
+      if (handler.returnType) {
+        throw new ParseError(`The handler '${EVENT_HANDLER}' has no return type: an event contract returns nothing`, handler.line);
+      }
+      const pub = functions.find((fn) => fn.pub);
+      if (pub) {
+        throw new ParseError(`An event contract is only run by its events, so function '${pub.name}' can't be pub`, pub.line);
+      }
+    } else {
+      if (handler) {
+        throw new ParseError(`'${EVENT_HANDLER}' is the handler of event contracts; name this function something else`, handler.line);
+      }
+      if (!functions.some((fn) => fn.pub)) {
+        throw this.error(`Contract '${label}' needs at least one entrypoint: 'pub fn name(...) { ... }'`);
+      }
+    }
+
+    // Parameters are declared in a scope beneath the contract's top level, so they can't reuse its names.
+    const topLevel = new Set(body.map((statement) => (statement as { name: string }).name));
+    for (const fn of functions) {
+      for (const parameter of fn.parameters) {
+        if (topLevel.has(parameter.name)) {
+          throw new ParseError(`Parameter '${parameter.name}' of function '${fn.name}' has the name of a contract-level declaration`, fn.line);
+        }
+      }
+    }
+
+    // A state variable is the contract's, by name, wherever it is declared, so every declaration of it agrees.
+    const stateDeclarations = new Map<string, { statement: VarDeclStatement; fn: FunctionDecl | undefined }>();
+    const declarations: { statement: Statement; fn: FunctionDecl | undefined }[] = [
+      ...body.map((statement) => ({ statement, fn: undefined })),
+      ...functions.flatMap((fn) => fn.body.map((statement) => ({ statement, fn }))),
+    ];
+    for (const { statement, fn } of declarations) {
+      if (statement.kind !== 'varDecl' || !statement.state) continue;
+      const first = stateDeclarations.get(statement.name);
+      if (!first) {
+        stateDeclarations.set(statement.name, { statement, fn });
+        continue;
+      }
+      if (!first.fn || !fn) {
+        throw new ParseError(`State variable '${statement.name}' is declared at the contract's top level, so its functions can't declare it again`, statement.line);
+      }
+      const typeOf = (declaration: VarDeclStatement) => (declaration.type ? typeToString(declaration.type) : undefined);
+      if (typeOf(first.statement) !== typeOf(statement) || Boolean(first.statement.state!.scope) !== Boolean(statement.state.scope)) {
+        throw new ParseError(
+          `State variable '${statement.name}' is declared in functions '${first.fn.name}' and '${fn.name}' with a different type or scoping: every declaration of it must agree`,
+          statement.line,
+        );
+      }
+    }
+
+    const byName = new Map(functions.map((fn) => [fn.name, fn]));
+    const callees = new Map<string, string[]>(functions.map((fn) => [fn.name, []]));
+    for (const { call, caller } of this.fnCalls) {
+      const fn = byName.get(call.name);
+      if (!fn) {
+        throw new ParseError(`Unknown function '${call.name}'`, call.line);
+      }
+      if (declaration.consumes && fn.name === EVENT_HANDLER) {
+        throw new ParseError(`The handler '${EVENT_HANDLER}' runs with each event; it can't be called`, call.line);
+      }
+      const declared = new Set(fn.parameters.map((parameter) => parameter.name));
+      for (const arg of call.args) {
+        if (!declared.has(arg.name)) {
+          throw new ParseError(`Function '${fn.name}' has no parameter '${arg.name}'`, call.line);
+        }
+      }
+      for (const parameter of fn.parameters) {
+        if (!call.args.some((arg) => arg.name === parameter.name)) {
+          throw new ParseError(`Missing argument '${parameter.name}' for function '${fn.name}'`, call.line);
+        }
+      }
+      if (caller) callees.get(caller.name)!.push(fn.name);
+    }
+
+    // No function may lead back to itself: without loops or recursion, a run's tokens stay bounded.
+    const done = new Set<string>();
+    const visit = (name: string, chain: string[]): void => {
+      if (chain.includes(name)) {
+        const cycle = [...chain.slice(chain.indexOf(name)), name].join(' -> ');
+        throw new ParseError(`Function '${name}' calls itself, which a contract can't do: ${cycle}`, byName.get(name)!.line);
+      }
+      if (done.has(name)) return;
+      for (const callee of callees.get(name)!) visit(callee, [...chain, name]);
+      done.add(name);
+    };
+    for (const fn of functions) visit(fn.name, []);
   }
 
   /**
@@ -271,7 +451,7 @@ export class Parser {
     return version;
   }
 
-  private parseParameterList(): ParameterDecl[] {
+  private parseParameterList(allowEmpty = false): ParameterDecl[] {
     this.expect('(', 'to start the parameter list');
     const parameters: ParameterDecl[] = [];
     const seen = new Set<string>();
@@ -287,7 +467,7 @@ export class Parser {
       if (!this.match(',')) break;
     }
     this.expect(')', 'to end the parameter list');
-    if (parameters.length === 0) {
+    if (parameters.length === 0 && !allowEmpty) {
       throw this.error('A parameter list must not be empty; omit the parentheses instead');
     }
     return parameters;
@@ -422,8 +602,9 @@ export class Parser {
       if (this.declarationKind !== 'contract') {
         throw this.error(`State variables can only be declared in a contract`, modifier);
       }
-      if (this.depth !== 1) {
-        throw this.error(`State variables must be declared at the top level of the contract body`, modifier);
+      // The contract's top level, or the top of a function's body, where its scope can name the parameters.
+      if (this.depth !== 1 && !(this.currentFunction && this.depth === 2)) {
+        throw this.error(`State variables must be declared at the contract's top level or at the top level of a function's body`, modifier);
       }
       state = {};
       if (this.match('(')) {
@@ -521,8 +702,14 @@ export class Parser {
     const next = this.peek();
     const hasValue = next.type !== '}' && next.type !== 'eof' && next.line === keyword.line;
     if (!hasValue) return this.owned({ kind: 'return', line: keyword.line, tokens: 0 }, start);
-    if (this.consumer) {
-      throw this.error('An event contract cannot return a value', keyword);
+    const fn = this.currentFunction;
+    if (fn && !fn.returnType) {
+      throw this.error(
+        this.consumer && fn.name === EVENT_HANDLER
+          ? 'An event contract cannot return a value'
+          : `Function '${fn.name}' declares no return type, so it can't return a value`,
+        keyword,
+      );
     }
     const value = this.parseExpression();
     return this.owned({ kind: 'return', value, line: keyword.line, tokens: 0 }, start, [value]);
@@ -766,6 +953,13 @@ export class Parser {
       }
       case 'identifier': {
         this.advance();
+        // A name followed by `(` on its line calls one of the contract's functions; nothing else can.
+        if (this.check('(') && this.peek().line === token.line) {
+          const args = this.parseCallArguments();
+          const call: FnCallExpr = { kind: 'fnCall', name: token.value, args, line: token.line, tokens: 0 };
+          this.fnCalls.push({ call, caller: this.currentFunction });
+          return this.owned(call, start, args.map((arg) => arg.value));
+        }
         return this.owned({ kind: 'identifier', name: token.value, line: token.line, tokens: 0 }, start);
       }
       case '(': {
@@ -800,7 +994,12 @@ export class Parser {
     }
     const templateParts: TemplatePart[] = parts.map((part) => {
       if (part.type === 'text') return { type: 'text', value: part.value };
-      const expression = new Parser(part.tokens).parseExpressionToEof();
+      // The interpolation is parsed in this script's context, so the function calls in it are resolved too.
+      const parser = new Parser(part.tokens);
+      parser.declarationKind = this.declarationKind;
+      parser.currentFunction = this.currentFunction;
+      const expression = parser.parseExpressionToEof();
+      this.fnCalls.push(...parser.fnCalls);
       return { type: 'expr', expression };
     });
     return { kind: 'templateString', parts: templateParts, line: token.line, tokens: 0 };

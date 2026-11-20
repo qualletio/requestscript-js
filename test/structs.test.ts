@@ -91,10 +91,10 @@ describe('structs: parsing', () => {
     expect(() => parseScript('struct a.S@2(previous: a.S@1)')).not.toThrow();
   });
 
-  it('parses struct types in contract parameters and return types', () => {
-    const declaration = parseScript('contract a.C(c: com.example.Customer@2): []com.example.Address@1 { }').declaration as ContractDecl;
-    expect(declaration.parameters[0]!.type).toEqual({ kind: 'struct', path: ['com', 'example'], name: 'Customer', version: '2' });
-    expect(declaration.returnType).toEqual({ kind: 'list', element: { kind: 'struct', path: ['com', 'example'], name: 'Address', version: '1' } });
+  it('parses struct types in function parameters and return types', () => {
+    const fn = parseScript('contract a.C { pub fn run(c: com.example.Customer@2): []com.example.Address@1 { } }').functions[0]!;
+    expect(fn.parameters[0]!.type).toEqual({ kind: 'struct', path: ['com', 'example'], name: 'Customer', version: '2' });
+    expect(fn.returnType).toEqual({ kind: 'list', element: { kind: 'struct', path: ['com', 'example'], name: 'Address', version: '1' } });
   });
 
   it('parses a struct-typed var, and still a resource reference without a version', () => {
@@ -142,11 +142,15 @@ describe('structs: parsing', () => {
 
 describe('structs: references', () => {
   it('lists the structs a script names, once each, in source order', () => {
-    const script = parseScript(`contract a.C(c: com.example.Customer@2): com.example.Address@1 {
-      var x: []com.example.Address@1 = []
-      if (true) { var y: b.Other@3 = null } else { var z: [][]b.Else@1 = [] }
+    const script = parseScript(`contract a.C {
+      var state x: []com.example.Address@1 = []
+      fn helper(): c.Late@1 { }
+      pub fn run(c: com.example.Customer@2): com.example.Address@1 {
+        if (true) { var y: b.Other@3 = null } else { var z: [][]b.Else@1 = [] }
+      }
     }`);
     expect(structReferences(script).map(typeToString)).toEqual([
+      'c.Late@1',
       'com.example.Customer@2',
       'com.example.Address@1',
       'b.Other@3',
@@ -208,16 +212,16 @@ describe('structs: checking values', () => {
   });
 
   it('checks contract parameters and return values', async () => {
-    const source = 'contract a.Ship(c: com.example.Customer@2): com.example.Address@1 {\n return c.addresses[0]\n}';
-    const result = await interpret(source, { structs, parameters: { c: { name: 'Ana', addresses: [{ street: 'Main', zip: '7' }] } } });
+    const source = 'contract a.Ship {\n pub fn run(c: com.example.Customer@2): com.example.Address@1 {\n  return c.addresses[0]\n }\n}';
+    const result = await interpret(source, { function: 'run', structs, parameters: { c: { name: 'Ana', addresses: [{ street: 'Main', zip: '7' }] } } });
     expect(result.returnValue).toEqual({ street: 'Main', zip: 7 });
 
-    const bad = interpret(source, { structs, parameters: { c: { addresses: [{ zip: 'x' }] } } });
+    const bad = interpret(source, { function: 'run', structs, parameters: { c: { addresses: [{ zip: 'x' }] } } });
     await expect(bad).rejects.toThrow(ParameterError);
     await expect(bad).rejects.toThrow("for parameter 'c'.addresses[0].zip");
 
-    const returned = interpret('contract a.R: com.example.Address@1 {\n return { zip: "x" }\n}', { structs });
-    await expect(returned).rejects.toThrow('returned from the contract');
+    const returned = interpret('contract a.R {\n pub fn run(): com.example.Address@1 {\n  return { zip: "x" }\n }\n}', { function: 'run', structs });
+    await expect(returned).rejects.toThrow("returned from function 'run'");
   });
 
   it('checks resource arguments and return values', async () => {
@@ -257,19 +261,19 @@ describe('structs: checking values', () => {
     const events: EventResolver = {
       resolve: async () => ({ path: 'a', name: 'Moved', version: '1', fields: [{ name: 'to', type: 'com.example.Address@1' }] }),
     };
-    const result = await interpret('contract a.OnMoved consumes a.Moved {\n var zip = to.zip\n}', { structs, events, parameters: { to: { zip: 3 } } });
+    const result = await interpret('contract a.OnMoved consumes a.Moved {\n fn on(to: com.example.Address@1) {\n  var zip = to.zip\n }\n}', { structs, events, parameters: { to: { zip: 3 } } });
     expect(result.returnValue).toBeNull();
-    await expect(interpret('contract a.OnMoved consumes a.Moved { }', { structs, events, parameters: { to: { zip: 'x' } } })).rejects.toThrow(ParameterError);
+    await expect(interpret('contract a.OnMoved consumes a.Moved { fn on(to: com.example.Address@1) { } }', { structs, events, parameters: { to: { zip: 'x' } } })).rejects.toThrow(ParameterError);
   });
 
   it('keeps state variables of struct types', async () => {
     const saved = new Map<string, StoredState>();
     const state: StateStore = { get: async (name) => saved.get(name) };
-    const source = 'contract a.Last(street: string): com.example.Address@1 {\n var state last: com.example.Address@1 = null\n var previous = last\n last = { street: street }\n return previous\n}';
-    for (const write of (await interpret(source, { structs, state, parameters: { street: 'One' } })).state) {
+    const source = 'contract a.Last {\n var state last: com.example.Address@1 = null\n pub fn run(street: string): com.example.Address@1 {\n  var previous = last\n  last = { street: street }\n  return previous\n }\n}';
+    for (const write of (await interpret(source, { function: 'run', structs, state, parameters: { street: 'One' } })).state) {
       saved.set(write.name, { value: write.value, type: write.type });
     }
-    const second = await interpret(source, { structs, state, parameters: { street: 'Two' } });
+    const second = await interpret(source, { function: 'run', structs, state, parameters: { street: 'Two' } });
     expect(second.returnValue).toEqual({ street: 'One', zip: null });
   });
 });

@@ -10,6 +10,8 @@ export const KEYWORDS = [
   'true',
   'false',
   'null',
+  'fn',
+  'pub',
 ] as const;
 
 export type Keyword = (typeof KEYWORDS)[number];

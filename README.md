@@ -11,11 +11,11 @@ The root export is the language itself — no server, database, or Express invol
 ```ts
 import { interpret } from "requestscript-js";
 
-const result = await interpret(source, { resources, parameters });
+const result = await interpret(source, { resources, function: "greet", parameters });
 console.log(result.returnValue);
 ```
 
-Everything needed to build on the language is exported: `tokenize`, `parseScript`, the AST types, `Decimal`, the error classes, the `Resource` interfaces, [token metering](#token-metering) (`TokenMeter`, `maxTokens`), `compareVersions` for ordering contract versions, the [state variable](#state-variables) store types with `encodeValue` and `decodeValue`, and the [event](#events) types with `emittedEvents`.
+Everything needed to build on the language is exported: `tokenize`, `parseScript`, the AST types, `Decimal`, the error classes, the `Resource` interfaces, [token metering](#token-metering) (`TokenMeter`, `maxTokens`), `compareVersions` for ordering contract versions, the [state variable](#state-variables) store types with `encodeValue` and `decodeValue`, the [event](#events) types with `emittedEvents`, and, for a contract's [functions](#functions), `entrypoints`, `entrypoint` and `walkStatements` (every statement of a script, its functions' included).
 
 The HTTP server lives behind the `requestscript-js/server` subpath:
 
@@ -65,52 +65,60 @@ Every release must run scripts exactly as earlier releases did, since a host may
 
 ## HTTP API
 
-| Method & path                         | Body                        | Purpose                                                                          |
-| ------------------------------------- | --------------------------- | -------------------------------------------------------------------------------- |
-| `POST /run`                           | script text                 | Execute a `request` script once; responds `{ "returnValue": ... }`               |
-| `POST /contracts`                     | script text                 | Create a `contract` script (`201`); `409` if that version already exists         |
-| `POST /run/<path>/<Name>`             | `{ "parameters": { ... } }` | Invoke the latest version of a saved contract (omit the body when parameterless) |
-| `POST /run/<path>/<Name>@<n>`         | `{ "parameters": { ... } }` | Invoke a specific version of a saved contract                                    |
-| `GET /contracts`                      | —                           | List every saved contract version and its parameters                             |
+| Method & path                         | Body                                          | Purpose                                                                  |
+| ------------------------------------- | --------------------------------------------- | ------------------------------------------------------------------------ |
+| `POST /run`                           | script text                                   | Execute a `request` script once; responds `{ "returnValue": ... }`       |
+| `POST /contracts`                     | script text                                   | Create a `contract` script (`201`); `409` if that version already exists |
+| `POST /run/<path>/<Name>`             | `{ "function": "...", "parameters": { ... } }` | Run an entrypoint of the latest version of a saved contract             |
+| `POST /run/<path>/<Name>@<n>`         | `{ "function": "...", "parameters": { ... } }` | Run an entrypoint of a specific version of a saved contract             |
+| `GET /contracts`                      | —                                             | List every saved contract version and its entrypoints                    |
 | `DELETE /contracts/<path>/<Name>`     | —                           | Delete every version of a contract                                               |
 | `DELETE /contracts/<path>/<Name>@<n>` | —                           | Delete one version of a contract                                                 |
 
-Errors are returned as `{ "error": { "type", "message" } }`: lex/parse, parameter, and malformed-version errors are `400`, an already-existing contract version is `409`, script runtime errors are `422`, unknown contracts/routes are `404`.
+`function` names one of the contract's `pub` functions (an event contract's handler, `on`, runs without one). Saving and listing a contract answers its entrypoints as `functions: [{ name, parameters: [{ name, type }], returnType, payable }]`, with `returnType` `'void'` for a function that returns nothing.
+
+Errors are returned as `{ "error": { "type", "message" } }`: lex/parse, parameter, entrypoint (`EntrypointError`) and malformed-version errors are `400`, an already-existing contract version is `409`, script runtime errors are `422`, unknown contracts/routes are `404`.
 
 Contracts are created through the dedicated `POST /contracts` endpoint; posting a contract script to `/run` (or a request script to `/contracts`) is rejected with a hint.
 
-Contracts are immutable and keyed by `(path, name, version)`. The version is declared in the contract source after the name — `contract path.to.MyContract@1.2.3(param1: string) { ... }` — as dot-separated numbers (`@2`, `@1.5`, `@1.2.3`, ...), defaulting to `1` when omitted. Saving a `(path, name, version)` that already exists is rejected with `409`; to change a contract, save the entire contract again under a new version. "Latest" is decided by comparing versions numerically segment by segment (`1.10` is newer than `1.9`).
+Contracts are immutable and keyed by `(path, name, version)`. The version is declared in the contract source after the name — `contract path.to.MyContract@1.2.3 { ... }` — as dot-separated numbers (`@2`, `@1.5`, `@1.2.3`, ...), defaulting to `1` when omitted. Saving a `(path, name, version)` that already exists is rejected with `409`; to change a contract, save the entire contract again under a new version. "Latest" is decided by comparing versions numerically segment by segment (`1.10` is newer than `1.9`).
 
 ## The language
 
 RequestScript is a small, strictly typed scripting language with Typescript/Kotlin-flavoured syntax. This section is a complete reference for what this implementation accepts; [intro-guide.md](./intro-guide.md) is the original tutorial-style specification.
 
 ```
-contract shop.orders.LineTotal@2(item: object, taxRate: decimal(1, 4)) {
-    // Price a single line item
-    var subtotal: decimal = 0
-    subtotal = subtotal + item.price * item.quantity
-    const total = subtotal + subtotal * taxRate
-
-    if (total > 100 && item.giftWrap != true) {
-        return { total: total, note: "Free shipping" }
+contract shop.orders.LineTotal@2 {
+    // The price of an item before tax
+    fn subtotal(item: object): decimal {
+        return item.price * item.quantity
     }
 
-    return {
-        total: total,
-        note: "Taxed at ${taxRate * 100}%",
+    // Price a single line item
+    pub fn total(item: object, taxRate: decimal(1, 4)): object {
+        const before = subtotal(item: item)
+        const total = before + before * taxRate
+
+        if (total > 100 && item.giftWrap != true) {
+            return { total: total, note: "Free shipping" }
+        }
+
+        return {
+            total: total,
+            note: "Taxed at ${taxRate * 100}%",
+        }
     }
 }
 ```
 
-Invoked with `{ "parameters": { "item": { "price": 9.99, "quantity": 2 }, "taxRate": 0.0825 } }`, this returns `{ "returnValue": { "total": 21.62835, "note": "Taxed at 8.25%" } }`.
+Invoked with `{ "function": "total", "parameters": { "item": { "price": 9.99, "quantity": 2 }, "taxRate": 0.0825 } }`, this returns `{ "returnValue": { "total": 21.62835, "note": "Taxed at 8.25%" } }`.
 
 ### Lexical structure
 
 - **Comments** start with `//` and run to the end of the line.
 - **Whitespace and newlines** are insignificant, and statements need no separator (`var a = 1 var b = 2` is valid). The one exception is `return`: its value must start on the same line as the keyword, otherwise the `return` is bare.
 - **Identifiers** are `[A-Za-z_][A-Za-z0-9_]*` and are case-sensitive.
-- **Reserved keywords**: `request`, `contract`, `var`, `const`, `return`, `if`, `else`, `true`, `false`, `null`. Type names (`int32`, `string`, ...) are not reserved.
+- **Reserved keywords**: `request`, `contract`, `var`, `const`, `return`, `if`, `else`, `true`, `false`, `null`, `fn`, `pub`. Type names (`int32`, `string`, ...) are not reserved.
 - **Number literals** are decimal digits, optionally with a fractional part: `42`, `3.14`. There are no exponent, hex, or digit-separator forms, and a leading `.` (`.5`) is not a number. Negative numbers are written with unary minus (`-5`).
 - **String literals** use double quotes only and must fit on one line. Supported escapes are `\"`, `\\`, `\n`, `\t`, `\r`, and `\$`; any other escape is an error.
 
@@ -126,20 +134,59 @@ request MyRequest {
 }
 ```
 
-**Contract** scripts are saved on the server and invoked later, optionally with parameters:
+**Contract** scripts are saved on the server and run later, through one of their [functions](#functions):
 
 ```
-contract path.to.MyContract@1.2.3(name: string, tags: []string,) {
-    return "Hello ${name}"
+contract path.to.MyContract@1.2.3 {
+    var state greeted: int64 = 0
+
+    pub fn greet(name: string, tags: []string,): string {
+        greeted = greeted + 1
+        return "Hello ${name}"
+    }
+
+    pub fn count(): int64 {
+        return greeted
+    }
 }
 ```
 
 - The name may be preceded by a dot-separated path. Path segments may be any word, including keywords (`contract if.else.Thing` is allowed).
 - The optional `@<version>` is one or more dot-separated numbers with no spaces (`@2`, `@1.5`, `@1.2.3`, or deeper) and defaults to `1`. Versions are compared numerically per segment, with missing segments counting as 0, so `@1.10` is newer than `@1.9`. Versions are matched exactly as written, so `@1.0` and `@1` are distinct. See [HTTP API](#http-api) for how versions are stored and invoked.
-- Parameters are `name: type` pairs, separated by commas, with an optional trailing comma. Names must be unique. A parameterless contract omits the parentheses entirely; `()` is an error.
-- An optional return type follows the parameters after a colon: `contract shop.Total(items: []object): decimal { ... }`, or `contract shop.Count: int32 { ... }` without parameters. The value the contract returns is converted to that type like an assignment (`int32` widens to `decimal`, `null` is always allowed), and any other value is a runtime error. A contract without one may return anything.
-- Parameters are `const` bindings. When invoked, every declared parameter must be supplied, unknown parameters are rejected, and each value is converted to its declared type (see [JSON encoding](#json-encoding)). Supplying parameters to a `request` script is an error.
-- `payable` before `contract` makes a [payable contract](#money), which accepts money attached to a call. An event contract can't be payable.
+- The contract's body holds only [state variables](#state-variables) (`var state`), resource bindings (`const r: path.Name@version`) and functions, in any order. Its state variables and bindings are declared, in source order, every time the contract runs, before the function it runs. Any other statement outside a function is a parse error.
+- A contract takes no parameters and has no return type of its own: its functions do. `contract a.B(x: int32)`, `contract a.B: int32` and `payable contract` are parse errors (they were RequestScript 1's syntax).
+
+### Functions
+
+A contract's functions are declared with `fn`. A `pub fn` is an **entrypoint**: the host runs a contract by naming one, with the `function` option of `interpret` (and callers call it as `ref.name(...)`). Functions without `pub` are private: only the contract's own functions call them.
+
+```
+contract shop.Cart@1 {
+    var state(caller.org) total: decimal = 0
+
+    fn price(item: object): decimal {
+        return item.price * item.quantity
+    }
+
+    pub fn add(item: object): decimal {
+        total = total + price(item: item)
+        return total
+    }
+
+    pub fn clear() {
+        total = 0
+    }
+}
+```
+
+- A function is `[pub] [payable] fn name(parameter: type, ...)[: type] { ... }`. Parameters are `name: type` pairs, separated by commas, with an optional trailing comma, and names must be unique; `()` declares none, and the parentheses are required. Function names must be unique in a contract.
+- An optional return type follows the parameters after a colon. The value the function returns is converted to that type like an assignment (`int32` widens to `decimal`, `null` is always allowed), and any other value is a runtime error. A function without one returns nothing: it evaluates to `null`, and `return value` in it is a parse error (a bare `return` ends it).
+- A function is called by its name, with named arguments in any order: `total(of: items)`. A call evaluates to what the function returns, not to a `{ value, error }` result, and a runtime error or `fail` in it fails the run. Any function may call any other, `pub` ones included, but never itself, directly or through other functions: unknown functions, missing or unknown arguments, and recursion are parse errors. With no loops and no recursion, a run's [tokens](#token-metering) stay bounded.
+- Arguments are evaluated in the order of the function's parameters, converted to their types, and bound as `const`. A function runs in a scope of its own beneath the contract's top level: it sees the contract's state variables and resource bindings, and the built-ins, but not its caller's variables. Its parameters can't take the name of a state variable or binding declared at the contract's top level (a parse error).
+- Only a contract has functions: calling one in a request script is a parse error.
+- `pub payable fn` makes a [payable entrypoint](#money), which accepts money attached to a call. `payable` follows `pub`; a private function can't be payable.
+- When run, an entrypoint's every declared parameter must be supplied, unknown parameters are rejected, and each value is converted to its declared type (see [JSON encoding](#json-encoding)). Supplying parameters to a `request` script is an error. Running a contract without a `function`, or naming one it doesn't have or doesn't make `pub`, is an `EntrypointError` (a `ParameterError`).
+- `result.function` names the entrypoint a contract ran. `entrypoints(script)` lists a contract's entrypoints, and `maxTokens(script, name)` bounds one of them.
 
 ### Types
 
@@ -188,35 +235,42 @@ request ClientId {
 ```
 
 - Built-ins are constants, and read-only all the way down: `jwt = ...`, `jwt.sub = "x"` and `jwt.aud[0] = "x"` are runtime errors. So is changing one through another variable (`var copy = jwt` refers to the same value). Copy a field into a variable to work with it (`var sub = jwt.sub`).
-- Their names are reserved: declaring a variable with a built-in's name, in any scope, is a runtime error, and so is a contract parameter with that name (a `ParameterError`).
+- Their names are reserved: declaring a variable with a built-in's name, in any scope, is a runtime error, and so is an entrypoint parameter with that name (a `ParameterError`).
 - Values are converted like resource results: numbers become `int32`, `int64` or `decimal`, and objects and lists convert recursively. A `null` built-in still reserves its name.
 - Names must be identifiers and not keywords; anything else throws a plain `Error`, since it is a host bug.
 
-Two built-ins come from the language rather than `builtins`, and are declared only when the host passes them (a payable contract always has `payment`):
+Two built-ins come from the language rather than `builtins`, and are declared only when the host passes them (a payable entrypoint's run always has `payment`):
 
 - **`now`**: the `now` option, as an `int64` of milliseconds since the Unix epoch. The interpreter never reads the clock itself, so a run that's given the same `now` runs the same way.
 - **`payment`**: see [Money](#money).
 
 ### State variables
 
-A contract can keep values between invocations in **state variables**, declared with `var state` at the top level of its body:
+A contract can keep values between invocations in **state variables**, declared with `var state` at the top level of the contract, or at the top level of a function's body, where its scope can use the function's parameters:
 
 ```
-contract shop.Visits(page: string): int32 {
+contract shop.Visits {
     var state total: int32 = 0
-    var state(page) perPage: int32 = 0
 
-    total = total + 1
-    perPage = perPage + 1
-    return perPage
+    pub fn visit(page: string): int32 {
+        var state(page) perPage: int32 = 0
+        total = total + 1
+        perPage = perPage + 1
+        return perPage
+    }
+
+    pub fn visits(): int32 {
+        return total
+    }
 }
 ```
 
-- `var state name = value` is one copy shared by every invocation. `var state(scope) name = value` keeps one copy per value of `scope`, any expression that evaluates to a string or an integer. Scopes keep their kind, so `3` and `"3"` are different copies.
-- When the declaration runs, the stored copy is loaded. If there isn't one yet, the initializer runs, and it can use parameters and built-ins. The initializer's tokens are metered only when it runs.
-- A state variable is an ordinary `var` in the body. Assignments and in-place changes to its lists and objects are all kept.
+- `var state name = value` is one copy shared by every invocation, of every function. `var state(scope) name = value` keeps one copy per value of `scope`, any expression that evaluates to a string or an integer. Scopes keep their kind, so `3` and `"3"` are different copies.
+- When the declaration runs, the stored copy is loaded. If there isn't one yet, the initializer runs, and it can use built-ins (and, in a function, its parameters). The initializer's tokens are metered only when it runs. The contract's top-level declarations run before the entrypoint, so their scopes and initializers can't use any function's parameters.
+- A state variable belongs to the contract, by name, wherever it is declared. Several functions may declare the same one, each declaration with the same type and with a scope or without one (a parse error otherwise), and within a run each scope of it is one variable: a function that declares it again, for the same scope, gets the same value. A name declared at the contract's top level can't be declared again in a function.
+- A state variable is an ordinary `var` in its scope. Assignments and in-place changes to its lists and objects are all kept.
 - A stored value is converted to the declaration's type, as an assignment would be, so a later version of a contract can widen a type. A value that doesn't fit is a runtime error. Without a declared type, the variable keeps the type it was first stored with.
-- State variables must be `var`, at the top level of a contract body, and can't hold resources. Anything else is a parse error. `state` isn't a reserved word, so `var state = 1` still declares a variable called `state`.
+- State variables must be `var`, at the top level of a contract or of a function's body (not in an `if`), and can't hold resources. Anything else is a parse error. `state` isn't a reserved word, so `var state = 1` still declares a variable called `state`.
 
 The interpreter doesn't store anything itself. A host passes a `state` store to `interpret`, which loads each variable when its declaration runs. The run returns the final values in `result.state`, and the host saves them all only if the run succeeded:
 
@@ -227,7 +281,7 @@ const store: StateStore = {
   // Returns { value, type, version } as last saved, or undefined.
   get: async (name, scope) => load(name, scope),
 };
-const result = await interpret(source, { state: store, parameters });
+const result = await interpret(source, { state: store, function: "visit", parameters });
 await save(result.state); // [{ name, scope, value, type, version? }]
 ```
 
@@ -247,24 +301,29 @@ The name, path and version work as for contracts, and the fields as parameters (
 A request or contract publishes an event with `emit`, naming every field:
 
 ```
-contract shop.Checkout(orderId: string, total: decimal) {
-    emit shop.OrderPlaced(orderId: orderId, total: total)
+contract shop.Checkout {
+    pub fn checkout(orderId: string, total: decimal) {
+        emit shop.OrderPlaced(orderId: orderId, total: total)
+    }
 }
 ```
 
-An **event contract** runs with each event of a type it `consumes`. It declares no parameters and no return type, since the event's fields are its parameters, and it can't return a value (a bare `return` ends it):
+An **event contract** runs with each event of a type it `consumes`. Its handler is the function `on`, which takes the event's fields it reads as its parameters, each with the field's own type, and returns nothing (a bare `return` ends it). It has no `pub` functions, since only its events run it, but it may have private ones:
 
 ```
 contract shop.OnOrderPlaced consumes shop.OrderPlaced@1 {
     const log: com.example.Logger
-    log.info(message: "Order ${orderId}: ${total}")
+
+    fn on(orderId: string, total: decimal) {
+        log.info(message: "Order ${orderId}: ${total}")
+    }
 }
 ```
 
 - `emit` names an event as `path.Name` or `path.Name@version`. Each field is converted to its type like a resource argument, and a missing or unknown field is a runtime error.
 - The interpreter doesn't publish anything. A host passes an `events` resolver to `interpret`, which looks up each event type, and the run returns its events in `result.events` (`[{ path, name, version, data }]`, with `data` as JSON). The host publishes them only if the run succeeded. Without a resolver, `emit` and running an event contract are runtime errors.
-- To run an event contract, the host passes the event's data as its `parameters`, which are checked against the event's fields.
-- `emittedEvents(script)` lists every event a script's `emit` statements name, for a host to check before it accepts the script.
+- To run an event contract, the host passes the event's data as its `parameters`, which are checked against the event's fields. The handler gets the fields it declares; a handler parameter that isn't a field of the event, or has another type, is a runtime error. `on` can't be `pub`, have a return type or be called, and a contract that consumes nothing can't declare a function called `on`.
+- `emittedEvents(script)` lists every event a script's `emit` statements name, in its functions too, for a host to check before it accepts the script.
 - `event`, `emit`, `consumes` and `restricted` aren't reserved words: they act as keywords only before a name, so they are still valid variable names.
 
 ```ts
@@ -289,12 +348,14 @@ struct shop.Customer@2(name: string, addresses: []shop.Address@1, credit: decima
 
 The name, path and version work as for contracts, except that the version is required. The fields work as parameters and may be any type, including other structs and lists of them. A struct can't contain itself, directly or through other structs.
 
-A struct type is the struct's name and version, wherever a type can be written: parameters, return types, `var` and `const` annotations, state variables, event fields, and resource function type strings (`'shop.Address@1'`). A struct type without a version is an error, so a type always means the same fields.
+A struct type is the struct's name and version, wherever a type can be written: function parameters, return types, `var` and `const` annotations, state variables, event fields, and resource function type strings (`'shop.Address@1'`). A struct type without a version is an error, so a type always means the same fields.
 
 ```
-contract shop.Ship(customer: shop.Customer@2): shop.Address@1 {
-    var home: shop.Address@1 = { street: "1 Main St", zip: 12345 }
-    return customer.addresses[0]
+contract shop.Ship {
+    pub fn ship(customer: shop.Customer@2): shop.Address@1 {
+        var home: shop.Address@1 = { street: "1 Main St", zip: 12345 }
+        return customer.addresses[0]
+    }
 }
 ```
 
@@ -386,7 +447,7 @@ There is no modulo operator, no compound assignment (`+=`), and no increment/dec
 - **`return`**: ends the script immediately. The value becomes the response's `returnValue`. A bare `return`, or reaching the end of the script without one, returns `null`.
 - **`fail`**: `fail "reason"` fails the run on purpose with a `ScriptFailure`, whose `reason` is the message. The message is any string expression, on the same line as `fail`. A host saves nothing of a run that fails. `fail` isn't a reserved word: it starts a statement only when its message follows.
 
-There are no loops or user-defined functions.
+There are no loops. A contract's [functions](#functions) are the only functions a script declares, and they can't recurse.
 
 ### Resources
 
@@ -464,10 +525,13 @@ Pass resources to `interpret` with `resourceResolver: createResourceResolver([..
 A resource may be versioned, such as one version of a deployed contract: the host sets `version` on it. A script binds a version by writing it after `@`:
 
 ```
-contract com.example.Market(jobId: string): object {
+contract com.example.Market {
     const job: com.example.Job@3
     const weather: com.example.Weather
-    return job.run(jobId: jobId)
+
+    pub fn start(jobId: string): object {
+        return job.start(jobId: jobId)
+    }
 }
 ```
 
@@ -491,16 +555,24 @@ request Hire {
 - **Options:** `amount`, an integer from 0 to `Number.MAX_SAFE_INTEGER`; `payees`, a list of 1 to `MAX_PAYEES` (16) distinct organizations the money may be paid to; and in a contract, `from`, whose funding it comes from, and `key`, a string or `null`. A request script must name `payees` and can't name `from` or `key`; a contract must name `from`. These rules are checked when the script is parsed, and the values when the call runs, before anything is sent.
 - **Pinned versions:** a call that attaches money must bind its resource by version, `com.example.Job@1`, in a request script too, so the money pays for the code its payer read.
 - **The invoker** receives a fourth argument, a `CallAttachment` (`{ amount, payees?, from?, key? }`), only when the amount is more than 0. An amount of 0 attaches nothing, and the call is made as any other.
-- **Payable contracts** are declared with `payable contract ...`, and read the money attached to their call as the built-in `payment`: `{ amount: int64, from: string, payees: []string }`, from the host's `payment` option. Without one, `payment` is `{ amount: 0, from: null, payees: [] }`. A contract that isn't payable refuses a `payment` with an amount, and declares `payment` only when the host passes one, so existing contracts may keep using the name.
+- **Payable entrypoints** are declared with `pub payable fn ...`, and their runs read the money attached to the call as the built-in `payment`: `{ amount: int64, from: string, payees: []string }`, from the host's `payment` option. Without one, `payment` is `{ amount: 0, from: null, payees: [] }`. The functions the entrypoint calls read it too. An entrypoint that isn't payable refuses a `payment` with an amount, and its run declares `payment` only when the host passes one, so such functions may use the name. Each entrypoint is payable or not on its own, so a contract can take money in one and none in another.
 
 ```
-payable contract com.example.Tip(note: string): int64 {
-    if (payment.amount == 0) {
-        fail "attach a tip"
+contract com.example.Tip {
+    pub payable fn tip(note: string): int64 {
+        if (payment.amount == 0) {
+            fail "attach a tip"
+        }
+        return payment.amount
     }
-    return payment.amount
+
+    pub fn thanks(): string {
+        return "Thank you!"
+    }
 }
 ```
+
+A caller attaches money to `tip.tip{amount: 1000000, payees: [...]}(note: "great")`; calling `thanks` with money attached is refused.
 
 #### Custom invokers
 
@@ -529,7 +601,7 @@ Hosts can price and limit scripts by the tokens they execute. A token is one lex
 
 Each statement and expression owns the tokens it was parsed from, minus those owned by its children, and the interpreter counts a node's tokens just before running it. So a run counts exactly the code it executed:
 
-- The declaration (`request R`, or a contract's name, version and parameter list) and the body's outer braces are free.
+- The declaration (`request R`, or a contract's name and version), the body's outer braces, and each function's signature and braces are free. A call to a contract function counts its name, parentheses and argument names, then its arguments, then the function's body as it runs.
 - An `if` counts each condition it evaluates together with that branch's `if`/`else if`, parentheses and braces, then the body of the branch it takes. The `else` keyword and its braces count only when the else body runs. Untaken branches cost nothing.
 - The operand a short-circuiting `&&` or `||` skips is not counted.
 - A string counts as one token, plus the tokens of each `${}` interpolation as it is evaluated.
@@ -540,26 +612,28 @@ import { interpret, maxTokens, parseScript, TokenMeter } from "requestscript-js"
 
 const script = parseScript(source);
 maxTokens(script); // the most any run can execute: each if takes its costliest path
+maxTokens(script, "add"); // a contract's top level plus its entrypoint `add`, with the functions it calls
+// Without a name, a contract's bound is its costliest entrypoint's.
 
 const meter = new TokenMeter(10_000); // optional limit
 const result = await interpret(source, { meter, signal });
 result.usage.tokens; // also on meter.tokens, which survives a failed run
 ```
 
-Because there are no loops or user-defined functions, `maxTokens` is a finite bound known before the script runs. A node that would take the count past the meter's limit is not run, and the script fails with `TokenLimitError` (a `RuntimeError`). `signal` is an `AbortSignal`, checked before each statement, expression and resource call.
+Because there are no loops and a contract's functions can't recurse, `maxTokens` is a finite bound known before the script runs. A node that would take the count past the meter's limit is not run, and the script fails with `TokenLimitError` (a `RuntimeError`). `signal` is an `AbortSignal`, checked before each statement, expression and resource call.
 
 ### JSON encoding
 
 A script's return value is encoded as JSON under `returnValue`. Lists and objects map to arrays and objects, and `int32`, `boolean`, `string`, and `null` map directly. `int64` and `decimal` values are encoded as JSON numbers when that is lossless, and otherwise as strings (e.g. `"9223372036854775807"`).
 
-Contract parameters arrive as JSON and are converted to their declared types. Integers must be whole numbers within range. For `int64` and `decimal` parameters, strings are accepted too, so high-precision values can be sent without losing precision (`"amount": "12345678901234567.89"`). Inside `object` parameters, and for resource return types declared as `object`, values get inferred types: whole numbers become `int32` or `int64`, other numbers become `decimal`.
+Entrypoint parameters arrive as JSON and are converted to their declared types. Integers must be whole numbers within range. For `int64` and `decimal` parameters, strings are accepted too, so high-precision values can be sent without losing precision (`"amount": "12345678901234567.89"`). Inside `object` parameters, and for resource return types declared as `object`, values get inferred types: whole numbers become `int32` or `int64`, other numbers become `decimal`.
 
 ### Errors
 
 Interpreter failures are thrown as typed errors, which the server maps to HTTP status codes:
 
 - `LexError` and `ParseError` (HTTP `400`) cover malformed source: unknown characters, unterminated strings, unknown types, duplicate keys or parameters, a missing declaration, and so on. They carry a line and column.
-- `ParameterError` (HTTP `400`) is raised for missing, unknown, or wrongly-typed contract parameters.
+- `ParameterError` (HTTP `400`) is raised for missing, unknown, or wrongly-typed entrypoint parameters. Its subclass `EntrypointError` is raised when the host names no entrypoint of a contract, or one the contract doesn't have or doesn't make `pub`.
 - `RuntimeError` (HTTP `422`) covers everything detected while running: type mismatches, unknown variables, redeclaration, assigning to a `const`, overflow, division by zero, out-of-bounds indexes, non-boolean conditions, and passing a meter's token limit (`TokenLimitError`). It carries a line number.
 - `ScriptFailure` (a `RuntimeError`, HTTP `422`) is a script failing on purpose with `fail`. Its `reason` is the script's message.
 
@@ -570,4 +644,4 @@ A resource function failing is not one of these. It is reported to the script as
 - `src/lang/` — the language: lexer, parser, AST, exact `Decimal`, type checking/coercion, tree-walking interpreter, resource interfaces. Re-exported as the package root (`requestscript-js`).
 - `src/server/` — the `requestscript-js/server` subpath: express app (`app.ts`), `startServer` bootstrap (`start.ts`), contract storage via drizzle (`contracts.ts`), database schema and migrations (`db/`).
 - `src/bin/requestscript-server.ts` — the `requestscript-server` executable.
-- `test/` — vitest suites covering the lexer, parser, decimal arithmetic, every language feature, resources, contract parameters, and the HTTP server (against embedded PGlite with the real migrations).
+- `test/` — vitest suites covering the lexer, parser, decimal arithmetic, every language feature, resources, contract functions and parameters, and the HTTP server (against embedded PGlite with the real migrations).

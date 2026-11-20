@@ -48,9 +48,14 @@ describe('interpreter: built-in variables', () => {
     await expect(runBody('var jwt = 1', { builtins: { jwt: null } })).rejects.toThrow(/'jwt' is a built-in variable/);
   });
 
-  it('rejects a contract parameter with a built-in name', async () => {
-    const script = 'contract path.to.C(jwt: string) { return jwt }';
-    await expect(run(script, { parameters: { jwt: 'x' }, builtins })).rejects.toThrow(ParameterError);
+  it('rejects an entrypoint parameter with a built-in name', async () => {
+    const script = 'contract path.to.C { pub fn run(jwt: string): string { return jwt } }';
+    await expect(run(script, { function: 'run', parameters: { jwt: 'x' }, builtins })).rejects.toThrow(ParameterError);
+  });
+
+  it('rejects a private function parameter with a built-in name when it is called', async () => {
+    const script = 'contract path.to.C {\n  fn f(jwt: string): string { return jwt }\n  pub fn run(): string { return f(jwt: "x") }\n}';
+    await expect(run(script, { function: 'run', builtins })).rejects.toThrow(/'jwt' is a built-in variable/);
   });
 
   it('leaves names free when no built-ins are passed', async () => {

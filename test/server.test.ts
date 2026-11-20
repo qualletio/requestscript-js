@@ -9,6 +9,11 @@ import type { Resource } from '../src/lang/resource.js';
 import { createApp } from '../src/server/app.js';
 import { schema } from '../src/server/db/index.js';
 
+/** A contract `header` (its path, name and version) with one entrypoint, `run`, returning `value`. */
+const returning = (header: string, value: string, type = 'int32') => `contract ${header} {\n  pub fn run(): ${type} {\n    return ${value}\n  }\n}`;
+/** The metadata of the entrypoint `returning` declares. */
+const RUN = { name: 'run', parameters: [], returnType: 'int32', payable: false };
+
 const addResource: Resource = {
   path: 'path.to',
   name: 'AddResource',
@@ -94,7 +99,7 @@ describe('POST /run', () => {
   });
 
   it('rejects contract scripts', async () => {
-    const response = await postScript('/run', 'contract C { return 1 }');
+    const response = await postScript('/run', returning('C', '1'));
     expect(response.status).toBe(400);
     expect(response.body.error.type).toBe('InvalidScript');
   });
@@ -125,58 +130,61 @@ describe('POST /contracts', () => {
   it('creates a contract and returns its metadata', async () => {
     const response = await postScript(
       '/contracts',
-      'contract path.to.MyContract(param1: string) { return "Hello ${param1}!" }',
+      'contract path.to.MyContract {\n  pub fn run(param1: string): string {\n    return "Hello ${param1}!"\n  }\n  pub payable fn tip(): int64 {\n    return payment.amount\n  }\n}',
     );
     expect(response.status).toBe(201);
     expect(response.body).toEqual({
       path: 'path.to',
       name: 'MyContract',
       version: '1',
-      parameters: [{ name: 'param1', type: 'string' }],
+      functions: [
+        { name: 'run', parameters: [{ name: 'param1', type: 'string' }], returnType: 'string', payable: false },
+        { name: 'tip', parameters: [], returnType: 'int64', payable: true },
+      ],
     });
   });
 
   it('creates a contract with a declared version', async () => {
-    const response = await postScript('/contracts', 'contract a.b.C@7 { return 7 }');
+    const response = await postScript('/contracts', returning('a.b.C@7', '7'));
     expect(response.status).toBe(201);
-    expect(response.body).toEqual({ path: 'a.b', name: 'C', version: '7', parameters: [] });
+    expect(response.body).toEqual({ path: 'a.b', name: 'C', version: '7', functions: [RUN] });
   });
 
   it('creates contracts with decimal and semantic versions', async () => {
-    const semver = await postScript('/contracts', 'contract a.b.C@1.2.3 { return 1 }');
+    const semver = await postScript('/contracts', returning('a.b.C@1.2.3', '1'));
     expect(semver.status).toBe(201);
-    expect(semver.body).toEqual({ path: 'a.b', name: 'C', version: '1.2.3', parameters: [] });
+    expect(semver.body).toEqual({ path: 'a.b', name: 'C', version: '1.2.3', functions: [RUN] });
 
-    const decimal = await postScript('/contracts', 'contract a.b.C@1.5 { return 1 }');
+    const decimal = await postScript('/contracts', returning('a.b.C@1.5', '1'));
     expect(decimal.status).toBe(201);
     expect(decimal.body.version).toBe('1.5');
   });
 
   it('rejects re-saving an existing version; contracts are immutable', async () => {
-    await postScript('/contracts', 'contract a.b.C { return 1 }');
-    const sameVersion = await postScript('/contracts', 'contract a.b.C { return 2 }');
+    await postScript('/contracts', returning('a.b.C', '1'));
+    const sameVersion = await postScript('/contracts', returning('a.b.C', '2'));
     expect(sameVersion.status).toBe(409);
     expect(sameVersion.body.error.type).toBe('ContractExists');
 
-    const explicitSameVersion = await postScript('/contracts', 'contract a.b.C@1 { return 2 }');
+    const explicitSameVersion = await postScript('/contracts', returning('a.b.C@1', '2'));
     expect(explicitSameVersion.status).toBe(409);
 
-    const invoked = await request(app).post('/run/a/b/C').send({});
+    const invoked = await request(app).post('/run/a/b/C').send({ function: 'run' });
     expect(invoked.body).toEqual({ returnValue: 1 });
   });
 
   it('saves a new version alongside the old one', async () => {
-    await postScript('/contracts', 'contract a.b.C { return 1 }');
-    const response = await postScript('/contracts', 'contract a.b.C@2 { return 2 }');
+    await postScript('/contracts', returning('a.b.C', '1'));
+    const response = await postScript('/contracts', returning('a.b.C@2', '2'));
     expect(response.status).toBe(201);
-    expect(response.body).toEqual({ path: 'a.b', name: 'C', version: '2', parameters: [] });
+    expect(response.body).toEqual({ path: 'a.b', name: 'C', version: '2', functions: [RUN] });
   });
 
   it('allows the same name at different paths', async () => {
-    await postScript('/contracts', 'contract a.C { return "a" }');
-    await postScript('/contracts', 'contract b.C { return "b" }');
-    expect((await request(app).post('/run/a/C').send({})).body).toEqual({ returnValue: 'a' });
-    expect((await request(app).post('/run/b/C').send({})).body).toEqual({ returnValue: 'b' });
+    await postScript('/contracts', returning('a.C', '"a"', 'string'));
+    await postScript('/contracts', returning('b.C', '"b"', 'string'));
+    expect((await request(app).post('/run/a/C').send({ function: 'run' })).body).toEqual({ returnValue: 'a' });
+    expect((await request(app).post('/run/b/C').send({ function: 'run' })).body).toEqual({ returnValue: 'b' });
   });
 
   it('rejects request scripts', async () => {
@@ -194,17 +202,17 @@ describe('POST /contracts', () => {
 
 describe('POST /run/<path>/<name>', () => {
   it('invokes a contract with parameters', async () => {
-    await postScript('/contracts', 'contract path.to.MyContract(param1: string) { return "Hello ${param1}!" }');
+    await postScript('/contracts', 'contract path.to.MyContract {\n  pub fn run(param1: string): string {\n    return "Hello ${param1}!"\n  }\n  pub payable fn tip(): int64 {\n    return payment.amount\n  }\n}');
     const response = await request(app)
       .post('/run/path/to/MyContract')
-      .send({ parameters: { param1: 'World' } });
+      .send({ function: 'run', parameters: { param1: 'World' } });
     expect(response.status).toBe(200);
     expect(response.body).toEqual({ returnValue: 'Hello World!' });
   });
 
   it('invokes a parameterless contract with no body', async () => {
-    await postScript('/contracts', 'contract MyParameterlessContract { return "ok" }');
-    const response = await request(app).post('/run/MyParameterlessContract');
+    await postScript('/contracts', returning('MyParameterlessContract', '"ok"', 'string'));
+    const response = await request(app).post('/run/MyParameterlessContract').send({ function: 'run' });
     expect(response.status).toBe(200);
     expect(response.body).toEqual({ returnValue: 'ok' });
   });
@@ -212,79 +220,92 @@ describe('POST /run/<path>/<name>', () => {
   it('contracts can use resources', async () => {
     await postScript(
       '/contracts',
-      'contract math.Sum(a: int32, b: int32) {\nconst r: path.to.AddResource\nconst sum = r.add(first: a, second: b)\nreturn sum.value\n}',
+      'contract math.Sum {\nconst r: path.to.AddResource\npub fn run(a: int32, b: int32): int32 {\nconst sum = r.add(first: a, second: b)\nreturn sum.value\n}\n}',
     );
-    const response = await request(app).post('/run/math/Sum').send({ parameters: { a: 20, b: 22 } });
+    const response = await request(app).post('/run/math/Sum').send({ function: 'run', parameters: { a: 20, b: 22 } });
     expect(response.body).toEqual({ returnValue: 42 });
   });
 
   it('invokes the latest version by default and a pinned version via @', async () => {
-    await postScript('/contracts', 'contract a.C { return 1 }');
-    await postScript('/contracts', 'contract a.C@3 { return 3 }');
-    expect((await request(app).post('/run/a/C').send({})).body).toEqual({ returnValue: 3 });
-    expect((await request(app).post('/run/a/C@1').send({})).body).toEqual({ returnValue: 1 });
-    expect((await request(app).post('/run/a/C@3').send({})).body).toEqual({ returnValue: 3 });
+    await postScript('/contracts', returning('a.C', '1'));
+    await postScript('/contracts', returning('a.C@3', '3'));
+    expect((await request(app).post('/run/a/C').send({ function: 'run' })).body).toEqual({ returnValue: 3 });
+    expect((await request(app).post('/run/a/C@1').send({ function: 'run' })).body).toEqual({ returnValue: 1 });
+    expect((await request(app).post('/run/a/C@3').send({ function: 'run' })).body).toEqual({ returnValue: 3 });
   });
 
   it('orders versions numerically per segment, not lexically', async () => {
-    await postScript('/contracts', 'contract a.C@1.9 { return 19 }');
-    await postScript('/contracts', 'contract a.C@1.10 { return 110 }');
-    await postScript('/contracts', 'contract a.C@1.2.99 { return 1299 }');
-    expect((await request(app).post('/run/a/C').send({})).body).toEqual({ returnValue: 110 });
-    expect((await request(app).post('/run/a/C@1.9').send({})).body).toEqual({ returnValue: 19 });
-    expect((await request(app).post('/run/a/C@1.2.99').send({})).body).toEqual({ returnValue: 1299 });
+    await postScript('/contracts', returning('a.C@1.9', '19'));
+    await postScript('/contracts', returning('a.C@1.10', '110'));
+    await postScript('/contracts', returning('a.C@1.2.99', '1299'));
+    expect((await request(app).post('/run/a/C').send({ function: 'run' })).body).toEqual({ returnValue: 110 });
+    expect((await request(app).post('/run/a/C@1.9').send({ function: 'run' })).body).toEqual({ returnValue: 19 });
+    expect((await request(app).post('/run/a/C@1.2.99').send({ function: 'run' })).body).toEqual({ returnValue: 1299 });
+  });
+
+  it('runs the entrypoint the body names, and answers 400 for a missing or unknown one', async () => {
+    await postScript('/contracts', 'contract a.Two {\n  pub fn one(): int32 { return 1 }\n  pub fn two(): int32 { return 2 }\n  fn hidden(): int32 { return 3 }\n}');
+    expect((await request(app).post('/run/a/Two').send({ function: 'two' })).body).toEqual({ returnValue: 2 });
+    for (const body of [{}, { function: 'three' }, { function: 'hidden' }]) {
+      const response = await request(app).post('/run/a/Two').send(body);
+      expect(response.status).toBe(400);
+      expect(response.body.error.type).toBe('EntrypointError');
+    }
+    const invalid = await request(app).post('/run/a/Two').send({ function: 2 });
+    expect(invalid.status).toBe(400);
+    expect(invalid.body.error.type).toBe('InvalidBody');
   });
 
   it('returns 404 for unknown contracts', async () => {
-    const response = await request(app).post('/run/no/such/Contract').send({});
+    const response = await request(app).post('/run/no/such/Contract').send({ function: 'run' });
     expect(response.status).toBe(404);
     expect(response.body.error.type).toBe('UnknownContract');
   });
 
   it('returns 404 for unknown versions of an existing contract', async () => {
-    await postScript('/contracts', 'contract a.C { return 1 }');
-    const response = await request(app).post('/run/a/C@2').send({});
+    await postScript('/contracts', returning('a.C', '1'));
+    const response = await request(app).post('/run/a/C@2').send({ function: 'run' });
     expect(response.status).toBe(404);
     expect(response.body.error.message).toContain("'a.C@2'");
   });
 
   it('rejects malformed version suffixes', async () => {
-    await postScript('/contracts', 'contract a.C { return 1 }');
+    await postScript('/contracts', returning('a.C', '1'));
     for (const suffix of ['@', '@x', '@1.', '@.1', '@1..2', '@1.2.x']) {
-      const response = await request(app).post(`/run/a/C${encodeURIComponent(suffix)}`).send({});
+      const response = await request(app).post(`/run/a/C${encodeURIComponent(suffix)}`).send({ function: 'run' });
       expect(response.status).toBe(400);
       expect(response.body.error.type).toBe('InvalidVersion');
     }
   });
 
   it('rejects missing or invalid parameters with 400', async () => {
-    await postScript('/contracts', 'contract Greet(name: string) { return name }');
-    const missing = await request(app).post('/run/Greet').send({});
+    await postScript('/contracts', 'contract Greet { pub fn run(name: string): string { return name } }');
+    const missing = await request(app).post('/run/Greet').send({ function: 'run' });
     expect(missing.status).toBe(400);
     expect(missing.body.error.type).toBe('ParameterError');
 
-    const wrongType = await request(app).post('/run/Greet').send({ parameters: { name: 42 } });
+    const wrongType = await request(app).post('/run/Greet').send({ function: 'run', parameters: { name: 42 } });
     expect(wrongType.status).toBe(400);
 
-    const extra = await request(app).post('/run/Greet').send({ parameters: { name: 'x', more: 1 } });
+    const extra = await request(app).post('/run/Greet').send({ function: 'run', parameters: { name: 'x', more: 1 } });
     expect(extra.status).toBe(400);
   });
 
   it('rejects non-object parameters', async () => {
-    await postScript('/contracts', 'contract Greet(name: string) { return name }');
-    const response = await request(app).post('/run/Greet').send({ parameters: [1, 2] });
+    await postScript('/contracts', 'contract Greet { pub fn run(name: string): string { return name } }');
+    const response = await request(app).post('/run/Greet').send({ function: 'run', parameters: [1, 2] });
     expect(response.status).toBe(400);
     expect(response.body.error.type).toBe('InvalidBody');
   });
 
   it('reports contract runtime errors with 422', async () => {
-    await postScript('/contracts', 'contract Div(n: int32) { return 1 / n }');
-    const response = await request(app).post('/run/Div').send({ parameters: { n: 0 } });
+    await postScript('/contracts', 'contract Div { pub fn run(n: int32): int32 { return 1 / n } }');
+    const response = await request(app).post('/run/Div').send({ function: 'run', parameters: { n: 0 } });
     expect(response.status).toBe(422);
   });
 
   it('rejects malformed JSON bodies', async () => {
-    await postScript('/contracts', 'contract Greet(name: string) { return name }');
+    await postScript('/contracts', 'contract Greet { pub fn run(name: string): string { return name } }');
     const response = await request(app)
       .post('/run/Greet')
       .set('Content-Type', 'application/json')
@@ -296,33 +317,33 @@ describe('POST /run/<path>/<name>', () => {
 
 describe('GET /contracts and DELETE /contracts', () => {
   it('lists saved contracts including every version', async () => {
-    await postScript('/contracts', 'contract a.One { return 1 }');
-    await postScript('/contracts', 'contract a.One@2 { return 2 }');
-    await postScript('/contracts', 'contract b.Two(x: []int32) { return x }');
+    await postScript('/contracts', returning('a.One', '1'));
+    await postScript('/contracts', returning('a.One@2', '2'));
+    await postScript('/contracts', 'contract b.Two { pub fn run(x: []int32): []int32 { return x } }');
     const response = await request(app).get('/contracts');
     expect(response.status).toBe(200);
     expect(response.body).toEqual({
       contracts: [
-        { path: 'a', name: 'One', version: '1', parameters: [] },
-        { path: 'a', name: 'One', version: '2', parameters: [] },
-        { path: 'b', name: 'Two', version: '1', parameters: [{ name: 'x', type: '[]int32' }] },
+        { path: 'a', name: 'One', version: '1', functions: [RUN] },
+        { path: 'a', name: 'One', version: '2', functions: [RUN] },
+        { path: 'b', name: 'Two', version: '1', functions: [{ name: 'run', parameters: [{ name: 'x', type: '[]int32' }], returnType: '[]int32', payable: false }] },
       ],
     });
   });
 
   it('deletes all versions of a contract by name', async () => {
-    await postScript('/contracts', 'contract a.One { return 1 }');
-    await postScript('/contracts', 'contract a.One@2 { return 2 }');
+    await postScript('/contracts', returning('a.One', '1'));
+    await postScript('/contracts', returning('a.One@2', '2'));
     expect((await request(app).delete('/contracts/a/One')).status).toBe(204);
-    expect((await request(app).post('/run/a/One').send({})).status).toBe(404);
+    expect((await request(app).post('/run/a/One').send({ function: 'run' })).status).toBe(404);
     expect((await request(app).delete('/contracts/a/One')).status).toBe(404);
   });
 
   it('deletes a single version via @', async () => {
-    await postScript('/contracts', 'contract a.One { return 1 }');
-    await postScript('/contracts', 'contract a.One@2 { return 2 }');
+    await postScript('/contracts', returning('a.One', '1'));
+    await postScript('/contracts', returning('a.One@2', '2'));
     expect((await request(app).delete('/contracts/a/One@2')).status).toBe(204);
-    expect((await request(app).post('/run/a/One').send({})).body).toEqual({ returnValue: 1 });
+    expect((await request(app).post('/run/a/One').send({ function: 'run' })).body).toEqual({ returnValue: 1 });
     expect((await request(app).delete('/contracts/a/One@2')).status).toBe(404);
   });
 });

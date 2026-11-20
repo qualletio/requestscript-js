@@ -61,6 +61,8 @@ function ownedTokens(script: Script): number {
         return e.tokens + sum([e.object, e.index]);
       case 'call':
         return e.tokens + sum([e.callee, ...e.args.map((arg) => arg.value)]);
+      case 'fnCall':
+        return e.tokens + sum(e.args.map((arg) => arg.value));
       case 'unary':
         return e.tokens + sum([e.operand]);
       case 'binary':
@@ -69,7 +71,7 @@ function ownedTokens(script: Script): number {
         return e.tokens;
     }
   };
-  return block(script.body);
+  return block(script.body) + script.functions.reduce((sum, fn) => sum + block(fn.body), 0);
 }
 
 async function executedTokens(body: string, resources: Resource[] = []): Promise<number> {
@@ -114,9 +116,43 @@ describe('token ownership', () => {
     expect(ownedTokens(parseScript(source))).toBe(sourceTokens(tokenize(source)) - HEADER_TOKENS);
   });
 
-  it('owns no tokens in a contract declaration or its parameters', () => {
-    const script = parseScript('contract a.b.C@2(p: string, q: [][]int32) { return p }');
+  it('owns no tokens in a contract declaration, or a function\'s signature and braces', () => {
+    const script = parseScript('contract a.b.C@2 { pub payable fn run(p: string, q: [][]int32): string { return p } }');
     expect(ownedTokens(script)).toBe(2);
+  });
+
+  it('owns a function call\'s name, parentheses and argument names', () => {
+    // `f`, `(`, `x`, `:`, `)`, and the argument `1`, plus `return` and the 2 of `return 1` in f.
+    const script = parseScript('contract a.C { fn f(x: int32): int32 { return x } pub fn run(): int32 { return f(x: 1) } }');
+    expect(ownedTokens(script)).toBe(2 + 1 + 6);
+  });
+
+  it('counts the costliest entrypoint, or the one named, with the functions it calls', () => {
+    const script = parseScript(`contract a.C {
+  var state n: int32 = 0
+  fn big(): int32 {
+    return 1 + 2 + 3 + 4
+  }
+  pub fn cheap(): int32 {
+    return 1
+  }
+  pub fn costly(): int32 {
+    return big() + big()
+  }
+}`);
+    // The state declaration: `var`, `state`, `n`, `:`, `int32`, `=` and `0`.
+    expect(maxTokens(script, 'cheap')).toBe(7 + 2);
+    // `return`, `+`, two calls of 3 tokens, each running big's 8.
+    expect(maxTokens(script, 'costly')).toBe(7 + 2 + 2 * (3 + 8));
+    expect(maxTokens(script)).toBe(maxTokens(script, 'costly'));
+    expect(() => maxTokens(script, 'big')).toThrow("no entrypoint 'big'");
+  });
+
+  it('counts the most a contract run executes, within its static bound', async () => {
+    const source = 'contract a.C {\n  fn half(n: int64): int64 {\n    return n / 2\n  }\n  pub fn run(n: int64): int64 {\n    if (n > 10) {\n      return half(n: half(n: n))\n    } else {\n      return n\n    }\n  }\n}';
+    const meter = new TokenMeter();
+    await interpret(source, { function: 'run', parameters: { n: 40 }, meter });
+    expect(meter.tokens).toBe(maxTokens(parseScript(source), 'run'));
   });
 
   it('counts a string as one token whatever its length', () => {

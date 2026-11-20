@@ -5,7 +5,7 @@ import { maxTokens, TokenMeter } from '../src/lang/meter.js';
 import { parseScript } from '../src/lang/parser.js';
 import type { Resource } from '../src/lang/resource.js';
 
-/** A contract version, as a host serves one: versioned, with one function, `run`. */
+/** A contract version, as a host serves one: versioned, with one entrypoint, `run`. */
 const job: Resource = {
   path: 'com.example',
   name: 'Job',
@@ -29,46 +29,63 @@ async function attaching(source: string, options: Parameters<typeof interpret>[1
   return { result, calls };
 }
 
-describe('payable contracts', () => {
-  it('parses payable before contract, without making payable a keyword', () => {
-    const script = parseScript('payable contract com.example.Tip(note: string): int64 {\n  return payment.amount\n}');
-    expect(script.declaration).toMatchObject({ kind: 'contract', name: 'Tip', payable: true });
-    expect(parseScript('contract com.example.Tip: int32 {\n  return 1\n}').declaration).not.toHaveProperty('payable');
+/** A contract with one entrypoint, `run`, written `pub payable fn` when `payable`. */
+const contract = (name: string, signature: string, body: string, payable = true) =>
+  `contract com.example.${name} {\n  pub ${payable ? 'payable ' : ''}fn run${signature} {\n${body}\n  }\n}`;
+
+describe('payable functions', () => {
+  it('parses pub payable fn, without making payable a keyword', () => {
+    const script = parseScript(contract('Tip', '(note: string): int64', 'return payment.amount'));
+    expect(script.functions[0]).toMatchObject({ name: 'run', pub: true, payable: true });
+    expect(parseScript(contract('Tip', '(): int32', 'return 1', false)).functions[0]!.payable).toBe(false);
     expect(parseScript('request R {\n  var payable = 1\n  return payable\n}').body).toHaveLength(2);
   });
 
-  it('refuses a payable event contract', () => {
-    expect(() => parseScript('payable contract com.example.OnPaid consumes com.example.Paid {\n}')).toThrow(ParseError);
+  it('refuses a payable event handler', () => {
+    expect(() => parseScript('contract com.example.OnPaid consumes com.example.Paid {\n  pub payable fn on() { }\n}')).toThrow(ParseError);
   });
 
   it('reads the attached money as payment, which is never null', async () => {
-    const tip = 'payable contract com.example.Tip: object {\n  return { amount: payment.amount, from: payment.from, payees: payment.payees }\n}';
-    expect((await interpret(tip, { payment: { amount: 2_500_000, from: 'org_buyer', payees: ['org_courier'] } })).returnValue)
+    const tip = contract('Tip', '(): object', 'return { amount: payment.amount, from: payment.from, payees: payment.payees }');
+    expect((await interpret(tip, { function: 'run', payment: { amount: 2_500_000, from: 'org_buyer', payees: ['org_courier'] } })).returnValue)
       .toEqual({ amount: 2_500_000, from: 'org_buyer', payees: ['org_courier'] });
-    expect((await interpret(tip)).returnValue).toEqual({ amount: 0, from: null, payees: [] });
+    expect((await interpret(tip, { function: 'run' })).returnValue).toEqual({ amount: 0, from: null, payees: [] });
+  });
+
+  it('lets the payable entrypoint\'s helpers read payment too', async () => {
+    const source = 'contract com.example.Tip {\n  fn amount(): int64 {\n    return payment.amount\n  }\n  pub payable fn run(): int64 {\n    return amount()\n  }\n}';
+    expect((await interpret(source, { function: 'run', payment: { amount: 7, from: 'org_b', payees: ['org_a'] } })).returnValue).toBe(7);
   });
 
   it('keeps payment.amount an int64, so arithmetic on it is checked', async () => {
-    const half = 'payable contract com.example.Half: int64 {\n  return payment.amount * 70 / 100\n}';
-    expect((await interpret(half, { payment: { amount: 1_000_001, from: 'org_buyer', payees: ['org_a'] } })).returnValue).toBe(700_000);
-    const huge = 'payable contract com.example.Huge: int64 {\n  return payment.amount * 9223372036854775807\n}';
-    await expect(interpret(huge, { payment: { amount: 2, from: 'org_buyer', payees: ['org_a'] } })).rejects.toThrow('int64 overflow');
+    const half = contract('Half', '(): int64', 'return payment.amount * 70 / 100');
+    expect((await interpret(half, { function: 'run', payment: { amount: 1_000_001, from: 'org_buyer', payees: ['org_a'] } })).returnValue).toBe(700_000);
+    const huge = contract('Huge', '(): int64', 'return payment.amount * 9223372036854775807');
+    await expect(interpret(huge, { function: 'run', payment: { amount: 2, from: 'org_buyer', payees: ['org_a'] } })).rejects.toThrow('int64 overflow');
   });
 
   it('can\'t redeclare payment', async () => {
-    await expect(interpret('payable contract com.example.Tip: int32 {\n  var payment = 1\n  return payment\n}')).rejects.toThrow('built-in');
+    await expect(interpret(contract('Tip', '(): int32', 'var payment = 1\nreturn payment'), { function: 'run' })).rejects.toThrow('built-in');
   });
 
-  it('refuses money attached to a contract that isn\'t payable, and invalid amounts', async () => {
-    const plain = 'contract com.example.Plain: int64 {\n  return payment.amount\n}';
-    await expect(interpret(plain, { payment: { amount: 1, from: 'org_buyer', payees: ['org_a'] } })).rejects.toThrow("com.example.Plain isn't payable");
-    // A host may pass nothing attached, which such a contract reads as 0.
-    expect((await interpret(plain, { payment: { amount: 0, from: null, payees: [] } })).returnValue).toBe(0);
-    // Without one, a contract that isn't payable has no payment, so existing contracts may use the name.
-    expect((await interpret('contract com.example.Old: int32 {\n  var payment = 3\n  return payment\n}')).returnValue).toBe(3);
+  it('refuses money attached to a function that isn\'t payable, and invalid amounts', async () => {
+    const plain = contract('Plain', '(): int64', 'return payment.amount', false);
+    await expect(interpret(plain, { function: 'run', payment: { amount: 1, from: 'org_buyer', payees: ['org_a'] } }))
+      .rejects.toThrow("Function 'run' of contract 'com.example.Plain' isn't payable");
+    // A host may pass nothing attached, which such a function reads as 0.
+    expect((await interpret(plain, { function: 'run', payment: { amount: 0, from: null, payees: [] } })).returnValue).toBe(0);
+    // Without one, a function that isn't payable has no payment, so it may use the name.
+    expect((await interpret(contract('Old', '(): int32', 'var payment = 3\nreturn payment', false), { function: 'run' })).returnValue).toBe(3);
     for (const amount of [-1, 1.5, Number.MAX_SAFE_INTEGER + 1]) {
-      await expect(interpret('payable contract com.example.Tip: int32 {\n  return 1\n}', { payment: { amount, from: 'org_b', payees: ['org_a'] } })).rejects.toThrow(RuntimeError);
+      await expect(interpret(contract('Tip', '(): int32', 'return 1'), { function: 'run', payment: { amount, from: 'org_b', payees: ['org_a'] } })).rejects.toThrow(RuntimeError);
     }
+  });
+
+  it('marks each entrypoint payable or not on its own', async () => {
+    const shop = 'contract com.example.Shop {\n  pub payable fn buy(): int64 {\n    return payment.amount\n  }\n  pub fn price(): int64 {\n    return 5\n  }\n}';
+    const payment = { amount: 5, from: 'org_buyer', payees: ['org_shop'] };
+    expect((await interpret(shop, { function: 'buy', payment })).returnValue).toBe(5);
+    await expect(interpret(shop, { function: 'price', payment })).rejects.toThrow("Function 'price' of contract 'com.example.Shop' isn't payable");
   });
 });
 
@@ -81,15 +98,17 @@ describe('call options', () => {
 
   it('attach money from a contract\'s funding, with its key, narrowing payees', async () => {
     const market = [
-      'contract com.example.Market(buyer: string): string {',
+      'contract com.example.Market {',
       '  const job: com.example.Job@1',
-      '  return job.run{amount: 5, from: buyer, key: "order-1", payees: ["org_courier"]}(action: "fund").value',
+      '  pub fn buy(buyer: string): string {',
+      '    return job.run{amount: 5, from: buyer, key: "order-1", payees: ["org_courier"]}(action: "fund").value',
+      '  }',
       '}',
     ].join('\n');
-    const { calls } = await attaching(market, { parameters: { buyer: 'org_buyer' } });
+    const { calls } = await attaching(market, { function: 'buy', parameters: { buyer: 'org_buyer' } });
     expect(calls[0]!.attachment).toEqual({ amount: 5, payees: ['org_courier'], from: 'org_buyer', key: 'order-1' });
     const unearmarked = market.replace('key: "order-1", payees: ["org_courier"]', 'key: null');
-    expect((await attaching(unearmarked, { parameters: { buyer: 'org_buyer' } })).calls[0]!.attachment).toEqual({ amount: 5, from: 'org_buyer', key: null });
+    expect((await attaching(unearmarked, { function: 'buy', parameters: { buyer: 'org_buyer' } })).calls[0]!.attachment).toEqual({ amount: 5, from: 'org_buyer', key: null });
   });
 
   it('attach nothing for an amount of 0, and call the host as before', async () => {
@@ -126,7 +145,7 @@ describe('call options', () => {
 
   it('are checked when parsed', () => {
     const request = (options: string) => () => parseScript(`request R {\n  const job: com.example.Job@1\n  return job.run{${options}}(action: "x")\n}`);
-    const contract = (options: string) => () => parseScript(`contract com.example.C: string {\n  const job: com.example.Job@1\n  return job.run{${options}}(action: "x").value\n}`);
+    const contract = (options: string) => () => parseScript(`contract com.example.C {\n  const job: com.example.Job@1\n  pub fn run(): string {\n    return job.run{${options}}(action: "x").value\n  }\n}`);
     expect(request('amount: 1, payees: ["a"]')).not.toThrow();
     expect(request('payees: ["a"]')).toThrow('need an amount');
     expect(request('amount: 1')).toThrow('payees');
@@ -166,9 +185,9 @@ describe('now', () => {
 
 describe('fail', () => {
   it('fails the run on purpose with the script\'s reason', async () => {
-    const failing = interpret('payable contract com.example.Job(action: string): string {\n  if (payment.amount == 0) {\n    fail "fund needs money attached"\n  }\n  return action\n}', { parameters: { action: 'fund' } });
+    const failing = interpret(contract('Job', '(action: string): string', 'if (payment.amount == 0) {\n  fail "fund needs money attached"\n}\nreturn action'), { function: 'run', parameters: { action: 'fund' } });
     await expect(failing).rejects.toBeInstanceOf(ScriptFailure);
-    await expect(failing).rejects.toMatchObject({ reason: 'fund needs money attached', line: 3 });
+    await expect(failing).rejects.toMatchObject({ reason: 'fund needs money attached', line: 4 });
   });
 
   it('takes any string expression, and refuses anything else', async () => {
@@ -193,14 +212,16 @@ describe('fail', () => {
 describe('determinism', () => {
   it('runs the same way twice with the same inputs', async () => {
     const source = [
-      'payable contract com.example.Split(note: string): object {',
-      '  const author = payment.amount * 70 / 100',
-      '  var shares = { data: payment.amount - author, author: author }',
-      '  var label = "${note}: ${author} at ${now}"',
-      '  return { shares: shares, label: label, later: "b" < "a", ratio: 1.0 / 3 }',
+      'contract com.example.Split {',
+      '  pub payable fn split(note: string): object {',
+      '    const author = payment.amount * 70 / 100',
+      '    var shares = { data: payment.amount - author, author: author }',
+      '    var label = "${note}: ${author} at ${now}"',
+      '    return { shares: shares, label: label, later: "b" < "a", ratio: 1.0 / 3 }',
+      '  }',
       '}',
     ].join('\n');
-    const options = { parameters: { note: 'Ünïcode' }, payment: { amount: 1_000_001, from: 'org_buyer', payees: ['org_author', 'org_data'] }, now: 1_700_000_000_000 };
+    const options = { function: 'split', parameters: { note: 'Ünïcode' }, payment: { amount: 1_000_001, from: 'org_buyer', payees: ['org_author', 'org_data'] }, now: 1_700_000_000_000 };
     const first = await interpret(source, options);
     const second = await interpret(source, options);
     expect(JSON.stringify(second.returnValue)).toBe(JSON.stringify(first.returnValue));

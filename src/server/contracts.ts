@@ -1,23 +1,27 @@
 import { and, eq } from 'drizzle-orm';
-import type { ContractDecl } from '../lang/ast.js';
+import type { ContractDecl, Script } from '../lang/ast.js';
+import { entrypoints } from '../lang/functions.js';
 import { typeToString } from '../lang/types.js';
 import { compareVersions } from '../lang/versions.js';
 import { schema, type Database } from './db/index.js';
-import type { ContractRow, StoredContractParameter } from './db/schema.js';
+import type { ContractRow, StoredContractFunction } from './db/schema.js';
 
 export interface SavedContract {
   path: string;
   name: string;
   version: string;
-  parameters: StoredContractParameter[];
+  functions: StoredContractFunction[];
   /** False when (path, name, version) already existed; contracts are immutable. */
   created: boolean;
 }
 
-export function declaredParameters(declaration: ContractDecl): StoredContractParameter[] {
-  return declaration.parameters.map((parameter) => ({
-    name: parameter.name,
-    type: typeToString(parameter.type),
+/** A contract's entrypoints, with their type strings. */
+export function declaredFunctions(script: Script): StoredContractFunction[] {
+  return entrypoints(script).map((fn) => ({
+    name: fn.name,
+    parameters: fn.parameters.map((parameter) => ({ name: parameter.name, type: typeToString(parameter.type) })),
+    returnType: fn.returnType ? typeToString(fn.returnType) : 'void',
+    payable: fn.payable,
   }));
 }
 
@@ -28,15 +32,16 @@ export function declaredParameters(declaration: ContractDecl): StoredContractPar
  */
 export async function saveContract(
   db: Database,
-  declaration: ContractDecl,
+  script: Script & { declaration: ContractDecl },
   source: string,
 ): Promise<SavedContract> {
+  const { declaration } = script;
   const path = declaration.path.join('.');
-  const parameters = declaredParameters(declaration);
+  const functions = declaredFunctions(script);
 
   const inserted = await db
     .insert(schema.contracts)
-    .values({ path, name: declaration.name, version: declaration.version, source, parameters })
+    .values({ path, name: declaration.name, version: declaration.version, source, functions })
     .onConflictDoNothing({ target: [schema.contracts.path, schema.contracts.name, schema.contracts.version] })
     .returning({ id: schema.contracts.id });
 
@@ -44,7 +49,7 @@ export async function saveContract(
     path,
     name: declaration.name,
     version: declaration.version,
-    parameters,
+    functions,
     created: inserted.length > 0,
   };
 }

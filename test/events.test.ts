@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import type { ContractDecl, EmitStatement, EventDecl, IfStatement } from '../src/lang/ast.js';
 import { ParameterError, ParseError, RuntimeError } from '../src/lang/errors.js';
 import { emittedEvents } from '../src/lang/events.js';
+import { entrypoints } from '../src/lang/functions.js';
 import { interpret, type EventResolver, type EventType } from '../src/lang/interpreter.js';
 import { maxTokens, TokenMeter } from '../src/lang/meter.js';
 import { parseScript } from '../src/lang/parser.js';
@@ -53,28 +54,38 @@ describe('events: parsing', () => {
     expect(() => parseScript(source)).toThrow(message);
   });
 
-  it('parses an event contract', () => {
-    const declaration = parseScript('contract com.example.OnGreeted@3 consumes com.example.Greeted@2 { }').declaration as ContractDecl;
-    expect(declaration).toMatchObject({ kind: 'contract', name: 'OnGreeted', version: '3', parameters: [] });
-    expect(declaration.consumes).toEqual({ path: ['com', 'example'], name: 'Greeted', version: '2' });
-    expect(declaration.returnType).toBeUndefined();
+  it('parses an event contract and its handler', () => {
+    const script = parseScript('contract com.example.OnGreeted@3 consumes com.example.Greeted@2 {\n  fn on(who: string) { }\n}');
+    const declaration = script.declaration as ContractDecl;
+    expect(declaration).toEqual({ kind: 'contract', path: ['com', 'example'], name: 'OnGreeted', version: '3', consumes: { path: ['com', 'example'], name: 'Greeted', version: '2' } });
+    expect(script.functions[0]).toMatchObject({ name: 'on', pub: false, parameters: [{ name: 'who', type: { kind: 'string' } }] });
+    expect(entrypoints(script).map((fn) => fn.name)).toEqual(['on']);
   });
 
   it('parses an event contract without a pinned version', () => {
-    const declaration = parseScript('contract c.On consumes com.example.Greeted { }').declaration as ContractDecl;
+    const declaration = parseScript('contract c.On consumes com.example.Greeted { fn on() { } }').declaration as ContractDecl;
     expect(declaration.consumes).toEqual({ path: ['com', 'example'], name: 'Greeted' });
   });
 
   it.each([
-    ['parameters', 'contract c.On consumes a.E(x: string) { }', 'no parameters'],
-    ['a return type', 'contract c.On consumes a.E: string { }', 'no return type'],
-    ['a return value', 'contract c.On consumes a.E {\n  return 1\n}', 'cannot return a value'],
+    ['parameters', 'contract c.On consumes a.E(x: string) { fn on() { } }', "declare 'fn on(field: type, ...)'"],
+    ['a return type', 'contract c.On consumes a.E: string { fn on() { } }', "declare 'fn on(field: type, ...)'"],
+    ['no handler', 'contract c.On consumes a.E {\n  fn helper() { }\n}', 'needs a handler'],
+    ['a pub handler', 'contract c.On consumes a.E {\n  pub fn on() { }\n}', "isn't pub"],
+    ['a handler with a return type', 'contract c.On consumes a.E {\n  fn on(): int32 { }\n}', 'has no return type'],
+    ['a return value', 'contract c.On consumes a.E {\n  fn on() {\n    return 1\n  }\n}', 'cannot return a value'],
+    ['a pub function', 'contract c.On consumes a.E {\n  fn on() { }\n  pub fn other() { }\n}', "can't be pub"],
+    ['a call to its handler', 'contract c.On consumes a.E {\n  fn on() { }\n  fn other() {\n    on()\n  }\n}', "it can't be called"],
   ])('refuses an event contract with %s', (_, source, message) => {
     expect(() => parseScript(source)).toThrow(message);
   });
 
-  it('allows a bare return in an event contract', () => {
-    expect(() => parseScript('contract c.On consumes a.E {\n  return\n}')).not.toThrow();
+  it('refuses a handler named on in a contract that consumes nothing', () => {
+    expect(() => parseScript('contract c.C {\n  fn on() { }\n  pub fn run() { }\n}')).toThrow('handler of event contracts');
+  });
+
+  it('allows a bare return, and private helpers, in an event contract', () => {
+    expect(() => parseScript('contract c.On consumes a.E {\n  fn helper() { }\n  fn on() {\n    helper()\n    return\n  }\n}')).not.toThrow();
   });
 
   it('parses emit statements, in branches too', () => {
@@ -116,8 +127,11 @@ describe('events: emitting', () => {
     expect((await interpret('request R { return 1 }')).events).toEqual([]);
   });
 
-  it('emits from a contract', async () => {
-    const result = await interpret('contract c.C(who: string) {\n  emit com.example.Greeted(who: who, times: 1)\n}', {
+  it('emits from a contract, and finds the emits in its functions', async () => {
+    const source = 'contract c.C {\n  fn greet(who: string) {\n    emit com.example.Greeted(who: who, times: 1)\n  }\n  pub fn run(who: string) {\n    greet(who: who)\n  }\n}';
+    expect(emittedEvents(parseScript(source))).toEqual([{ path: ['com', 'example'], name: 'Greeted' }]);
+    const result = await interpret(source, {
+      function: 'run',
       events: resolver,
       parameters: { who: 'Ada' },
     });
@@ -151,9 +165,9 @@ describe('events: emitting', () => {
 });
 
 describe('events: consuming', () => {
-  const consumer = 'contract c.OnGreeted consumes com.example.Greeted {\n  emit com.example.Greeted(who: "${who}!", times: times + 1)\n}';
+  const consumer = 'contract c.OnGreeted consumes com.example.Greeted {\n  fn on(who: string, times: int64) {\n    emit com.example.Greeted(who: "${who}!", times: times + 1)\n  }\n}';
 
-  it("binds the event's fields as the contract's parameters", async () => {
+  it("binds the event's fields as the handler's parameters", async () => {
     const result = await interpret(consumer, { events: resolver, parameters: { who: 'Ada', times: '41' } });
     expect(result.returnValue).toBeNull();
     expect(result.events).toEqual([{ path: 'com.example', name: 'Greeted', version: '2', data: { who: 'Ada!', times: 42 } }]);
@@ -162,6 +176,29 @@ describe('events: consuming', () => {
   it('checks the event data against the fields', async () => {
     await expect(interpret(consumer, { events: resolver, parameters: { who: 'Ada' } })).rejects.toThrow(ParameterError);
     await expect(interpret(consumer, { events: resolver, parameters: { who: 'Ada', times: 1, other: 2 } })).rejects.toThrow("Unknown parameter 'other'");
+  });
+
+  it('lets the handler take only the fields it reads', async () => {
+    const source = 'contract c.OnGreeted consumes com.example.Greeted {\n  var state(who) seen: int32 = 0\n  fn on(who: string) {\n    seen = seen + 1\n  }\n}';
+    await expect(interpret(source, { events: resolver, parameters: { who: 'Ada', times: 1 }, state: { get: async () => undefined } }))
+      .rejects.toThrow("Unknown variable 'who'");
+    const inHandler = 'contract c.OnGreeted consumes com.example.Greeted {\n  fn on(who: string) {\n    var state(who) seen: int32 = 0\n    seen = seen + 1\n  }\n}';
+    const result = await interpret(inHandler, { events: resolver, parameters: { who: 'Ada', times: 1 }, state: { get: async () => undefined } });
+    expect(result.function).toBe('on');
+    expect(result.state).toEqual([{ name: 'seen', scope: { kind: 'string', key: 'Ada' }, value: 1, type: '{"kind":"int32"}' }]);
+  });
+
+  it("refuses a handler parameter that isn't a field of the event, or has another type", async () => {
+    const parameters = { who: 'Ada', times: 1 };
+    await expect(interpret('contract c.On consumes com.example.Greeted {\n  fn on(whom: string) { }\n}', { events: resolver, parameters }))
+      .rejects.toThrow("has no field 'whom' for the handler to take");
+    await expect(interpret('contract c.On consumes com.example.Greeted {\n  fn on(times: int32) { }\n}', { events: resolver, parameters }))
+      .rejects.toThrow("takes field 'times' as int32, but event 'com.example.Greeted' declares it int64");
+  });
+
+  it('runs only its handler', async () => {
+    await expect(interpret(consumer, { function: 'other', events: resolver, parameters: { who: 'Ada', times: 1 } }))
+      .rejects.toThrow("runs only its handler, 'on'");
   });
 
   it('needs the consumed event from the host', async () => {
