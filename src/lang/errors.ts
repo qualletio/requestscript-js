@@ -29,6 +29,9 @@ export class RuntimeError extends RequestScriptError {}
 /** Invalid parameters supplied when invoking a contract. */
 export class ParameterError extends RuntimeError {}
 
+/** The host named no entrypoint of a contract to run, or one the contract doesn't have or doesn't make `pub`. */
+export class EntrypointError extends ParameterError {}
+
 /** A script failed on purpose, with `fail message`. `reason` is the message the script gave. */
 export class ScriptFailure extends RuntimeError {
   constructor(readonly reason: string, line?: number) {

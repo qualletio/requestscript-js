@@ -1,6 +1,7 @@
 export * from './ast.js';
 export { Decimal, DecimalArithmeticError } from './decimal.js';
 export { emittedEvents } from './events.js';
+export { entrypoint, entrypoints, EVENT_HANDLER, walkStatements } from './functions.js';
 export {
   createStructResolver,
   MAX_STRUCT_DEPTH,
@@ -11,7 +12,7 @@ export {
   type StructResolver,
   type StructType,
 } from './structs.js';
-export { LexError, ParameterError, ParseError, RequestScriptError, RuntimeError, ScriptFailure } from './errors.js';
+export { EntrypointError, LexError, ParameterError, ParseError, RequestScriptError, RuntimeError, ScriptFailure } from './errors.js';
 export {
   Interpreter,
   createResourceResolver,

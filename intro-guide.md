@@ -31,34 +31,47 @@ request MyRequest {
 
 A comment is a line of the script that is ignored and used to help the user. Start the line of a comment with `//`.
 
-The declaration always goes "type" "name" "optional parameters".
+The declaration always goes "type" "name", and a contract's functions declare their own parameters.
 
 ### Contract type
 
-A Contract request type is a rerunnable script that is saved to the server and ran on command. Contracts can have parameters:
+A Contract request type is a rerunnable script that is saved to the server and ran on command. A contract has entrypoints, declared as `pub fn`s, and each one takes its own parameters:
 
 ```
-contract path.to.contract.MyContract(param1: string) {
-    // Script body goes here
+contract path.to.contract.MyContract {
+    pub fn doThing(data: string): string {
+        return "Do thing!"
+    }
 }
 ```
 
 The contract name is preceded by its path. Two contracts can have the same name, but only one contract can exist at a path with that name.
 
-If a contract does not have parameters, the parentheses are excluded:
+A contract can also have private functions, declared with `fn`, to organize its code and avoid repeating it, and state variables, declared at its top level or at the top of a function, that every function shares:
 
 ```
-contract MyParameterlessContract {
-    // Script body goes here
+contract com.example.MyContract@1 {
+    var state myData = ""
+
+    fn sayThing(): string {
+        return "Say thing!"
+    }
+
+    pub fn doThing(data: string): string {
+        myData = data
+        return sayThing()
+    }
 }
 ```
+
+Functions are called by name with named arguments, `sayThing()`, and can't call themselves. A function without a return type returns nothing.
 
 Parameters are specified by a parameter name, and its type (one of `int32`, `int64`, `decimal`, `boolean`, `string`, `object`, or square brackets followed by a type to indicate a list: `[]int32`)
 
 A contract is invoked with json to the http server.
 The url is the path to the contract ending with the contract's name.
 The http method is `POST`.
-The body of the request is a JSON object that takes in an subobject of parameters. If the contract does not have parameters, the object is excluded.
+The body of the request is a JSON object that names the function to run and takes in a subobject of its parameters. If the function does not have parameters, the parameters object is excluded.
 
 Example:
 
@@ -67,9 +80,20 @@ body:
 
 ```json
 {
+    "function": "doThing",
     "parameters": {
-        "param1:" "Hello World!"
+        "data": "Hello World!"
     }
+}
+```
+
+A request script calls a contract's function through a resource binding:
+
+```
+request MyRequest {
+    const myContract: com.example.MyContract@1
+
+    return myContract.doThing(data: "Hello World!")
 }
 ```
 

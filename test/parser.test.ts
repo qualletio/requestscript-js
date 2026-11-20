@@ -10,52 +10,51 @@ describe('parser: declarations', () => {
     expect(script.body).toEqual([]);
   });
 
-  it('parses a contract declaration with a path and parameters', () => {
-    const script = parseScript('contract path.to.contract.MyContract(param1: string) { }');
+  it('parses a contract declaration with a path, and its functions', () => {
+    const script = parseScript('contract path.to.contract.MyContract {\n  pub fn greet(param1: string) { }\n  fn helper(): int32 {\n    return 1\n  }\n}');
     const declaration = script.declaration as ContractDecl;
-    expect(declaration.kind).toBe('contract');
-    expect(declaration.path).toEqual(['path', 'to', 'contract']);
-    expect(declaration.name).toBe('MyContract');
-    expect(declaration.version).toBe('1');
-    expect(declaration.parameters).toEqual([{ name: 'param1', type: { kind: 'string' } }]);
+    expect(declaration).toEqual({ kind: 'contract', path: ['path', 'to', 'contract'], name: 'MyContract', version: '1' });
+    expect(script.body).toEqual([]);
+    expect(script.functions.map(({ name, pub, payable, parameters, returnType }) => ({ name, pub, payable, parameters, returnType }))).toEqual([
+      { name: 'greet', pub: true, payable: false, parameters: [{ name: 'param1', type: { kind: 'string' } }], returnType: undefined },
+      { name: 'helper', pub: false, payable: false, parameters: [], returnType: { kind: 'int32' } },
+    ]);
+    expect(script.functions[1]!.body).toHaveLength(1);
   });
 
-  it('parses a parameterless contract without parentheses', () => {
-    const script = parseScript('contract MyParameterlessContract { }');
-    const declaration = script.declaration as ContractDecl;
-    expect(declaration.path).toEqual([]);
-    expect(declaration.parameters).toEqual([]);
+  it('parses a path-less contract', () => {
+    const script = parseScript('contract MyContract { pub fn run() { } }');
+    expect((script.declaration as ContractDecl).path).toEqual([]);
   });
 
   it('parses a declared contract version', () => {
-    const script = parseScript('contract path.to.MyContract@3(param1: string) { }');
+    const script = parseScript('contract path.to.MyContract@3 { pub fn run() { } }');
     const declaration = script.declaration as ContractDecl;
     expect(declaration.name).toBe('MyContract');
     expect(declaration.version).toBe('3');
-    expect(declaration.parameters).toEqual([{ name: 'param1', type: { kind: 'string' } }]);
   });
 
-  it('parses a version on a parameterless contract', () => {
-    const script = parseScript('contract C@12 { }');
-    expect((script.declaration as ContractDecl).version).toBe('12');
+  it('parses functions\' return types', () => {
+    const returnType = (signature: string) => parseScript(`contract a.B { pub fn run${signature} { } }`).functions[0]!.returnType;
+    expect(returnType('(p: string): int32')).toEqual({ kind: 'int32' });
+    expect(returnType('(): []string')).toEqual({ kind: 'list', element: { kind: 'string' } });
+    expect(returnType('(): decimal(10, 2)')).toEqual({ kind: 'decimal', intDigits: 10, fracDigits: 2 });
+    expect(returnType('(p: string)')).toBeUndefined();
+    expect(() => parseScript('contract a.B { pub fn run(p: string): { } }')).toThrow();
   });
 
-  it('parses a declared return type', () => {
-    const returnType = (source: string) => (parseScript(source).declaration as ContractDecl).returnType;
-    expect(returnType('contract a.B(p: string): int32 { }')).toEqual({ kind: 'int32' });
-    expect(returnType('contract a.B@2: []string { }')).toEqual({ kind: 'list', element: { kind: 'string' } });
-    expect(returnType('contract a.B: decimal(10, 2) { }')).toEqual({ kind: 'decimal', intDigits: 10, fracDigits: 2 });
-    expect(returnType('contract a.B(p: string) { }')).toBeUndefined();
-    expect(() => parseScript('contract a.B(p: string): { }')).toThrow();
+  it('parses pub payable functions', () => {
+    const script = parseScript('contract a.B { pub payable fn pay() { } }');
+    expect(script.functions[0]).toMatchObject({ name: 'pay', pub: true, payable: true });
   });
 
   it('parses decimal and semantic versions', () => {
-    const version = (source: string) => (parseScript(source).declaration as ContractDecl).version;
-    expect(version('contract C@1.5 { }')).toBe('1.5');
-    expect(version('contract C@1.2.3 { }')).toBe('1.2.3');
-    expect(version('contract C@0.1.0 { }')).toBe('0.1.0');
-    expect(version('contract C@10.20.30.40 { }')).toBe('10.20.30.40');
-    expect(version('contract a.b.C@2.0(p: string) { }')).toBe('2.0');
+    const version = (header: string) => (parseScript(`${header} { pub fn run() { } }`).declaration as ContractDecl).version;
+    expect(version('contract C@1.5')).toBe('1.5');
+    expect(version('contract C@1.2.3')).toBe('1.2.3');
+    expect(version('contract C@0.1.0')).toBe('0.1.0');
+    expect(version('contract C@10.20.30.40')).toBe('10.20.30.40');
+    expect(version('contract a.b.C@2.0')).toBe('2.0');
   });
 
   it('rejects invalid contract versions', () => {
@@ -70,9 +69,8 @@ describe('parser: declarations', () => {
   });
 
   it('parses list and decimal parameter types with trailing commas', () => {
-    const script = parseScript('contract C(a: []int32, b: decimal(4, 3), c: [][]string,) { }');
-    const declaration = script.declaration as ContractDecl;
-    expect(declaration.parameters).toEqual([
+    const script = parseScript('contract C { pub fn run(a: []int32, b: decimal(4, 3), c: [][]string,) { } }');
+    expect(script.functions[0]!.parameters).toEqual([
       { name: 'a', type: { kind: 'list', element: { kind: 'int32' } } },
       { name: 'b', type: { kind: 'decimal', intDigits: 4, fracDigits: 3 } },
       { name: 'c', type: { kind: 'list', element: { kind: 'list', element: { kind: 'string' } } } },
@@ -84,12 +82,13 @@ describe('parser: declarations', () => {
     expect(() => parseScript('')).toThrow(ParseError);
   });
 
-  it('rejects empty parameter lists', () => {
-    expect(() => parseScript('contract C() { }')).toThrow(ParseError);
+  it('allows an empty parameter list on a function, and requires one', () => {
+    expect(parseScript('contract C { pub fn run() { } }').functions[0]!.parameters).toEqual([]);
+    expect(() => parseScript('contract C { pub fn run { } }')).toThrow(/needs a parameter list/);
   });
 
   it('rejects duplicate parameters', () => {
-    expect(() => parseScript('contract C(a: int32, a: string) { }')).toThrow(ParseError);
+    expect(() => parseScript('contract C { pub fn run(a: int32, a: string) { } }')).toThrow(/Duplicate parameter 'a'/);
   });
 
   it('rejects trailing garbage after the script body', () => {
@@ -97,7 +96,7 @@ describe('parser: declarations', () => {
   });
 
   it('rejects unknown types', () => {
-    expect(() => parseScript('contract C(a: number) { }')).toThrow(ParseError);
+    expect(() => parseScript('contract C { pub fn run(a: number) { } }')).toThrow(/Unknown type 'number'/);
     expect(() => parseScript('request R { var x: number = 1 }')).toThrow(ParseError);
   });
 });

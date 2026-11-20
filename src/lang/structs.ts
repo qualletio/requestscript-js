@@ -1,4 +1,5 @@
-import type { Script, Statement, StructDecl, StructRef, TypeNode } from './ast.js';
+import type { Script, StructDecl, StructRef, TypeNode } from './ast.js';
+import { walkStatements } from './functions.js';
 import { typeToString } from './types.js';
 
 /**
@@ -50,44 +51,26 @@ export function typeStructReferences(type: TypeNode): StructRef[] {
 }
 
 /**
- * Every struct a script names directly, once each, in source order: in its declaration's parameters, return
- * type or fields, and in its `var` and `const` types, including those in branches that may not run. It
- * doesn't include the structs those structs name, or the ones in the types of the resources and events the
- * script uses, which the host resolves when the script runs. A host checks them before it accepts the script.
+ * Every struct a script names directly, once each, in source order: in its event or struct fields, in its
+ * functions' parameters and return types, and in its `var` and `const` types, including those in branches
+ * and functions that may not run. It doesn't include the structs those structs name, or the ones in the types
+ * of the resources and events the script uses, which the host resolves when the script runs. A host checks
+ * them before it accepts the script.
  */
 export function structReferences(script: Script): StructRef[] {
   const declaration = script.declaration;
   const types: TypeNode[] = [];
-  switch (declaration.kind) {
-    case 'contract':
-      types.push(...declaration.parameters.map((parameter) => parameter.type));
-      if (declaration.returnType) types.push(declaration.returnType);
-      break;
-    case 'event':
-    case 'struct':
-      types.push(...declaration.fields.map((field) => field.type));
-      break;
-    case 'request':
-      break;
+  if (declaration.kind === 'event' || declaration.kind === 'struct') {
+    types.push(...declaration.fields.map((field) => field.type));
   }
-  types.push(...statementTypes(script.body));
-  return unique(types.flatMap(collectType));
-}
-
-function statementTypes(statements: Statement[]): TypeNode[] {
-  return statements.flatMap((statement): TypeNode[] => {
-    switch (statement.kind) {
-      case 'varDecl':
-        return statement.type ? [statement.type] : [];
-      case 'if':
-        return [
-          ...statement.branches.flatMap((branch) => statementTypes(branch.body)),
-          ...statementTypes(statement.elseBody ?? []),
-        ];
-      default:
-        return [];
-    }
+  for (const fn of script.functions) {
+    types.push(...fn.parameters.map((parameter) => parameter.type));
+    if (fn.returnType) types.push(fn.returnType);
+  }
+  walkStatements(script, (statement) => {
+    if (statement.kind === 'varDecl' && statement.type) types.push(statement.type);
   });
+  return unique(types.flatMap(collectType));
 }
 
 function collectType(type: TypeNode): StructRef[] {

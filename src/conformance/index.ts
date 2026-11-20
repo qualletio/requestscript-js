@@ -45,6 +45,8 @@ export interface ConformanceCall {
 export interface ConformanceCase {
   name: string;
   source: string;
+  /** The entrypoint a contract case runs. Omitted for a request script or an event contract. */
+  function?: string;
   parameters?: Record<string, unknown>;
   builtins?: Record<string, unknown>;
   payment?: { amount: number; from: string | null; payees: string[] };
@@ -133,6 +135,7 @@ export async function runConformanceCase(testCase: ConformanceCase): Promise<Con
       resourceResolver: createResourceResolver(resources),
       resourceInvoker,
       meter,
+      ...(testCase.function === undefined ? {} : { function: testCase.function }),
       ...(testCase.parameters === undefined ? {} : { parameters: testCase.parameters }),
       ...(testCase.builtins === undefined ? {} : { builtins: testCase.builtins }),
       ...(testCase.payment === undefined ? {} : { payment: testCase.payment }),

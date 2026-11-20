@@ -6,7 +6,7 @@ const request = (body: string): string => `request Case {\n${body}\n}`;
 const PAYER = 'org_payer';
 const COURIER = 'org_courier';
 
-/** A versioned contract another contract or script pays, with one function, `run`. */
+/** A versioned resource another contract or script pays, with one function, `run`. */
 const job = { path: 'com.example', name: 'Job', version: '1', functions: [{ name: 'run', parameters: [{ name: 'action', type: 'string' }], returnType: 'string' }] };
 
 /**
@@ -166,13 +166,15 @@ export const CONFORMANCE_CASES: readonly ConformanceCase[] = [
   // ---------- Money ----------
   {
     name: 'a payable contract reads the attached money, and splits it with truncating division',
-    source: 'payable contract com.example.Split: object {\n  const author = payment.amount * 70 / 100\n  return { author: author, data: payment.amount - author, from: payment.from, payees: payment.payees }\n}',
+    source: 'contract com.example.Split {\n  pub payable fn split(): object {\n    const author = payment.amount * 70 / 100\n    return { author: author, data: payment.amount - author, from: payment.from, payees: payment.payees }\n  }\n}',
+    function: 'split',
     payment: { amount: 1_000_001, from: PAYER, payees: ['org_author', 'org_data'] },
     expect: { returnValue: '{"author":700000,"data":300001,"from":"org_payer","payees":["org_author","org_data"]}', tokens: 36 },
   },
   {
     name: 'a payable contract without money attached reads a payment of 0',
-    source: 'payable contract com.example.Tip: object {\n  return payment\n}',
+    source: 'contract com.example.Tip {\n  pub payable fn tip(): object {\n    return payment\n  }\n}',
+    function: 'tip',
     expect: { returnValue: '{"amount":0,"from":null,"payees":[]}', tokens: 2 },
   },
   {
@@ -188,7 +190,8 @@ export const CONFORMANCE_CASES: readonly ConformanceCase[] = [
   },
   {
     name: 'a contract attaches money from a funder\'s funding under a key',
-    source: 'contract com.example.Market(buyer: string): string {\n  const job: com.example.Job@1\n  return job.run{amount: 5, from: buyer, key: null}(action: "fund").value\n}',
+    source: 'contract com.example.Market {\n  const job: com.example.Job@1\n\n  pub fn buy(buyer: string): string {\n    return job.run{amount: 5, from: buyer, key: null}(action: "fund").value\n  }\n}',
+    function: 'buy',
     parameters: { buyer: PAYER },
     resources: [job],
     responses: [{ value: 'ok' }],
@@ -246,7 +249,8 @@ export const CONFORMANCE_CASES: readonly ConformanceCase[] = [
   // ---------- Parameters ----------
   {
     name: 'contract parameters convert exactly from JSON',
-    source: 'contract com.example.P(n: int64, d: decimal, s: string): object {\n  return { n: n + 1, d: d * 2, s: s }\n}',
+    source: 'contract com.example.P {\n  pub fn convert(n: int64, d: decimal, s: string): object {\n    return { n: n + 1, d: d * 2, s: s }\n  }\n}',
+    function: 'convert',
     parameters: { n: '9007199254740993', d: '1.10', s: 'é' },
     expect: { returnValue: '{"n":"9007199254740994","d":2.2,"s":"é"}', tokens: 18 },
   },
@@ -254,7 +258,8 @@ export const CONFORMANCE_CASES: readonly ConformanceCase[] = [
   // ---------- State ----------
   {
     name: 'state is read from what was stored, and written with the version read',
-    source: 'contract com.example.Counter(job: string): int64 {\n  var state count: int64 = 0\n  var state(job) paid: int64 = 0\n  count = count + 1\n  paid = paid + 5\n  return count\n}',
+    source: 'contract com.example.Counter {\n  var state count: int64 = 0\n\n  pub fn pay(job: string): int64 {\n    var state(job) paid: int64 = 0\n    count = count + 1\n    paid = paid + 5\n    return count\n  }\n}',
+    function: 'pay',
     parameters: { job: 'job-1' },
     state: [{ name: 'count', scope: null, stored: { value: 41, type: '{"kind":"int64"}', version: 7 } }],
     expect: {
@@ -271,10 +276,68 @@ export const CONFORMANCE_CASES: readonly ConformanceCase[] = [
   // ---------- Events ----------
   {
     name: 'an emitted event records its data in field order',
-    source: 'contract com.example.Deliver(job: string): string {\n  emit com.example.Delivered(job: job, at: 5)\n  return job\n}',
+    source: 'contract com.example.Deliver {\n  pub fn deliver(job: string): string {\n    emit com.example.Delivered(job: job, at: 5)\n    return job\n  }\n}',
+    function: 'deliver',
     parameters: { job: 'job-1' },
     events: [{ path: 'com.example', name: 'Delivered', version: '1', fields: [{ name: 'at', type: 'int64' }, { name: 'job', type: 'string' }] }],
     expect: { returnValue: '"job-1"', tokens: 17, events: [{ path: 'com.example', name: 'Delivered', version: '1', data: { at: 5, job: 'job-1' } }] },
+  },
+
+  // ---------- Functions (SIP-1) ----------
+  {
+    name: 'a contract runs the entrypoint the host names, sharing its state with the others',
+    source: 'contract com.example.Tally {\n  var state total: int64 = 0\n\n  pub fn add(n: int64): int64 {\n    total = total + n\n    return total\n  }\n\n  pub fn read(): int64 {\n    return total\n  }\n}',
+    function: 'add',
+    parameters: { n: 5 },
+    state: [{ name: 'total', scope: null, stored: { value: 10, type: '{"kind":"int64"}', version: 1 } }],
+    expect: { returnValue: '15', tokens: 13, state: [{ name: 'total', scope: null, value: { $int64: '15' }, type: '{"kind":"int64"}', version: 1 }] },
+  },
+  {
+    name: 'a private function is called by name, and returns its value directly',
+    source: 'contract com.example.Greeter {\n  fn greeting(name: string): string {\n    return "Hello, ${name}!"\n  }\n\n  pub fn greet(name: string): string {\n    return greeting(name: name)\n  }\n}',
+    function: 'greet',
+    parameters: { name: 'Ada' },
+    expect: { returnValue: '"Hello, Ada!"', tokens: 10 },
+  },
+  {
+    name: 'a function without a return type returns null, and its state is still written',
+    source: 'contract com.example.Counter2 {\n  var state count: int64 = 0\n\n  pub fn bump() {\n    count = count + 1\n  }\n}',
+    function: 'bump',
+    expect: { returnValue: 'null', tokens: 12, state: [{ name: 'count', scope: null, value: { $int64: '1' }, type: '{"kind":"int64"}' }] },
+  },
+  {
+    name: 'scoped state declared in two functions is one variable within a run',
+    source: 'contract com.example.Jobs {\n  fn credit(job: string, amount: int64) {\n    var state(job) paid: int64 = 0\n    paid = paid + amount\n  }\n\n  pub fn pay(job: string): int64 {\n    var state(job) paid: int64 = 0\n    credit(job: job, amount: 3)\n    credit(job: job, amount: 4)\n    return paid\n  }\n}',
+    function: 'pay',
+    parameters: { job: 'job-1' },
+    expect: { returnValue: '7', tokens: 60, state: [{ name: 'paid', scope: { kind: 'string', key: 'job-1' }, value: { $int64: '7' }, type: '{"kind":"int64"}' }] },
+  },
+  {
+    name: 'an entrypoint that isn\'t payable refuses attached money, even beside a payable one',
+    source: 'contract com.example.Shop {\n  pub payable fn buy(): int64 {\n    return payment.amount\n  }\n\n  pub fn price(): int64 {\n    return 5\n  }\n}',
+    function: 'price',
+    payment: { amount: 5, from: PAYER, payees: ['org_shop'] },
+    expect: { error: { type: 'RuntimeError', message: "Function 'price' of contract 'com.example.Shop' isn't payable, so money can't be attached to a call to it" }, tokens: 0 },
+  },
+  {
+    name: 'a function that isn\'t pub can\'t be run by the host',
+    source: 'contract com.example.Hidden {\n  fn secret(): int64 {\n    return 1\n  }\n\n  pub fn open(): int64 {\n    return secret()\n  }\n}',
+    function: 'secret',
+    expect: { error: { type: 'EntrypointError', message: "Function 'secret' of contract 'com.example.Hidden' isn't pub, so it can only be called from inside the contract" }, tokens: 0 },
+  },
+  {
+    name: 'a contract\'s top level runs before the entrypoint, so its state scopes can\'t name parameters',
+    source: 'contract com.example.Notify consumes com.example.Delivered@1 {\n  var state(job) delivered: boolean = false\n\n  fn on(job: string) {\n    delivered = true\n  }\n}',
+    parameters: { job: 'job-1', at: 5 },
+    events: [{ path: 'com.example', name: 'Delivered', version: '1', fields: [{ name: 'at', type: 'int64' }, { name: 'job', type: 'string' }] }],
+    expect: { error: { type: 'RuntimeError', message: "Unknown variable 'job' (line 2)" }, tokens: 9 },
+  },
+  {
+    name: 'an event handler declares scoped state with the fields it takes',
+    source: 'contract com.example.Notify2 consumes com.example.Delivered@1 {\n  fn on(job: string) {\n    var state(job) delivered: boolean = false\n    delivered = true\n  }\n}',
+    parameters: { job: 'job-1', at: 5 },
+    events: [{ path: 'com.example', name: 'Delivered', version: '1', fields: [{ name: 'at', type: 'int64' }, { name: 'job', type: 'string' }] }],
+    expect: { returnValue: 'null', tokens: 13, state: [{ name: 'delivered', scope: { kind: 'string', key: 'job-1' }, value: true, type: '{"kind":"boolean"}' }] },
   },
 
   // ---------- Structs ----------

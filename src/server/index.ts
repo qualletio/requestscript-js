@@ -1,7 +1,7 @@
 export { createApp, type AppOptions } from './app.js';
 export { compareVersions } from '../lang/versions.js';
 export {
-  declaredParameters,
+  declaredFunctions,
   deleteContract,
   findContract,
   listContracts,
@@ -10,5 +10,5 @@ export {
 } from './contracts.js';
 export { DEFAULT_DATABASE_URL, databaseUrl, schema, type Database } from './db/index.js';
 export { MIGRATIONS_FOLDER, runMigrations } from './db/migrate.js';
-export type { ContractRow, StoredContractParameter } from './db/schema.js';
+export type { ContractRow, StoredContractFunction, StoredContractParameter } from './db/schema.js';
 export { startServer, type RunningServer, type StartServerOptions } from './start.js';

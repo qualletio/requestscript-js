@@ -6,13 +6,16 @@ import type {
   EmitStatement,
   EventRef,
   Expression,
+  FnCallExpr,
+  FunctionDecl,
   Script,
   Statement,
   StructRef,
   VarDeclStatement,
 } from './ast.js';
 import { Decimal, DecimalArithmeticError } from './decimal.js';
-import { ParameterError, RuntimeError, ScriptFailure } from './errors.js';
+import { EntrypointError, ParameterError, RuntimeError, ScriptFailure } from './errors.js';
+import { EVENT_HANDLER, entrypoints } from './functions.js';
 import { TokenMeter } from './meter.js';
 import { KEYWORDS } from './token.js';
 import { MAX_STRUCT_DEPTH, structLabel, structReferences, type StructResolver } from './structs.js';
@@ -34,6 +37,7 @@ import {
   hostToValue,
   inferType,
   parameterToValue,
+  typeToString,
   valueToHost,
   valueToJson,
   valueTypeName,
@@ -151,7 +155,12 @@ export interface InterpretOptions {
   resourceResolver?: ResourceResolver;
   /** Resource invoker to use for resource function calls. */
   resourceInvoker?: ResourceInvoker;
-  /** Contract parameter values (as parsed JSON). */
+  /**
+   * The function a contract runs: one of its `pub` functions. Required for a contract, except an event
+   * contract, which always runs its handler, `on`. A request script takes none.
+   */
+  function?: string;
+  /** The values of the entrypoint's parameters (as parsed JSON), or of an event contract's event fields. */
   parameters?: Record<string, unknown>;
   /**
    * Counts the tokens the script executes, and stops it at the meter's limit.
@@ -183,9 +192,9 @@ export interface InterpretOptions {
    */
   structs?: StructResolver;
   /**
-   * The money attached to the call that runs a contract. A payable contract reads it as the built-in `payment`,
-   * which is `{ amount: 0, from: null, payees: [] }` without one. A contract that isn't payable refuses an amount
-   * greater than 0, and declares `payment` only when the host passes one.
+   * The money attached to the call that runs a contract. A payable entrypoint's run reads it as the built-in
+   * `payment`, which is `{ amount: 0, from: null, payees: [] }` without one. An entrypoint that isn't payable
+   * refuses an amount greater than 0, and its run declares `payment` only when the host passes one.
    */
   payment?: Payment;
   /**
@@ -245,6 +254,8 @@ export interface StateWrite {
 
 export interface InterpretResult {
   declaration: Declaration;
+  /** The entrypoint a contract ran. Omitted for a request script. */
+  function?: string;
   /** The script's return value, already encoded as a JSON-compatible value. */
   returnValue: unknown;
   usage: {
@@ -393,6 +404,12 @@ export class Interpreter {
   /** Whether the current run is a contract's, which must bind versioned resources by their version. */
   private inContract = false;
 
+  /** The current contract's functions, by name. */
+  private functions = new Map<string, FunctionDecl>();
+
+  /** The current contract's top-level scope, which every function's scope sits beneath. */
+  private contractScope: Environment | undefined;
+
   /** The state variables declared in the current run, with their bindings, which hold their latest values. */
   private stateBindings: { name: string; scope: StateScope; binding: Binding; version?: unknown }[] = [];
 
@@ -400,9 +417,8 @@ export class Interpreter {
     script: Script,
     parameters?: Record<string, unknown>,
     builtins?: Record<string, unknown>,
-    context: { payment?: Payment | undefined; now?: number | bigint | Date | undefined } = {},
+    context: { payment?: Payment | undefined; now?: number | bigint | Date | undefined; function?: string | undefined } = {},
   ): Promise<InterpretResult> {
-    // Built-ins sit above the script's own scope, so no scope inside it can redeclare them.
     if (script.declaration.kind === 'event') {
       throw new RuntimeError('An event declaration declares an event type; it does not run');
     }
@@ -411,29 +427,35 @@ export class Interpreter {
     }
     this.structs = new Map();
     this.inContract = script.declaration.kind === 'contract';
+    const entry = this.selectEntrypoint(script, context.function);
     // Every struct the script names is resolved before anything runs, so an unknown one fails the run early.
     for (const ref of structReferences(script)) {
       await this.resolveStruct(ref, []);
     }
+    // Built-ins sit above the script's own scope, so no scope inside it can redeclare them.
     const builtinScope = bindBuiltins(builtins ?? {});
-    this.bindLanguageBuiltins(script, builtinScope, context);
+    this.bindLanguageBuiltins(script, entry, builtinScope, context);
     const root = new Environment(builtinScope);
-    await this.bindParameters(script.declaration, parameters, root);
+    // The entrypoint's scope sits beneath the contract's top level, whose names no parameter may take, so its
+    // parameters are bound, and checked, before the top level runs.
+    const entryScope = entry ? new Environment(root) : root;
+    await this.bindParameters(script.declaration, entry, parameters, entryScope);
     this.stateBindings = [];
     this.emitted = [];
+    this.functions = new Map(script.functions.map((fn) => [fn.name, fn]));
+    this.contractScope = root;
 
     let result: Value = NULL_VALUE;
-    try {
+    if (entry) {
       await this.execStatements(script.body, root);
-    } catch (error) {
-      if (error instanceof ReturnSignal) {
+      result = await this.execFunction(entry, entryScope);
+    } else {
+      try {
+        await this.execStatements(script.body, root);
+      } catch (error) {
+        if (!(error instanceof ReturnSignal)) throw error;
         result = error.value;
-      } else {
-        throw error;
       }
-    }
-    if (script.declaration.kind === 'contract' && script.declaration.returnType) {
-      result = this.coerce(result, script.declaration.returnType, 'returned from the contract');
     }
     // In-place changes to lists and objects are in the bindings' values too.
     const state = this.stateBindings.map(({ name, scope, binding, version }): StateWrite => ({
@@ -443,14 +465,90 @@ export class Interpreter {
       type: JSON.stringify(binding.type),
       ...(version === undefined ? {} : { version }),
     }));
-    return { declaration: script.declaration, returnValue: valueToJson(result), usage: { tokens: this.meter.tokens }, state, events: this.emitted };
+    return {
+      declaration: script.declaration,
+      ...(entry ? { function: entry.name } : {}),
+      returnValue: valueToJson(result),
+      usage: { tokens: this.meter.tokens },
+      state,
+      events: this.emitted,
+    };
+  }
+
+  /** The function a contract runs: the `pub` function the host names, or an event contract's handler. */
+  private selectEntrypoint(script: Script, name: string | undefined): FunctionDecl | undefined {
+    const declaration = script.declaration;
+    if (declaration.kind !== 'contract') {
+      if (name !== undefined) throw new EntrypointError('Only a contract has functions to run');
+      return undefined;
+    }
+    const label = [...declaration.path, declaration.name].join('.');
+    if (declaration.consumes) {
+      if (name !== undefined && name !== EVENT_HANDLER) {
+        throw new EntrypointError(`Event contract '${label}' runs only its handler, '${EVENT_HANDLER}'`);
+      }
+      const handler = script.functions.find((fn) => fn.name === EVENT_HANDLER);
+      if (!handler) throw new EntrypointError(`Event contract '${label}' has no handler '${EVENT_HANDLER}'`);
+      return handler;
+    }
+    if (name === undefined) {
+      const names = entrypoints(script).map((fn) => `'${fn.name}'`).join(', ');
+      throw new EntrypointError(`Name the function of contract '${label}' to run: ${names}`);
+    }
+    const fn = script.functions.find((candidate) => candidate.name === name);
+    if (!fn) throw new EntrypointError(`Contract '${label}' has no function '${name}'`);
+    if (!fn.pub) throw new EntrypointError(`Function '${name}' of contract '${label}' isn't pub, so it can only be called from inside the contract`);
+    return fn;
+  }
+
+  /** Runs a function's body in `env`, which holds its parameters, and checks what it returns. */
+  private async execFunction(fn: FunctionDecl, env: Environment): Promise<Value> {
+    let result: Value = NULL_VALUE;
+    try {
+      await this.execStatements(fn.body, env);
+    } catch (error) {
+      if (!(error instanceof ReturnSignal)) throw error;
+      result = error.value;
+    }
+    if (!fn.returnType) return NULL_VALUE;
+    return this.coerce(result, fn.returnType, `returned from function '${fn.name}'`, fn.line);
   }
 
   /**
-   * Declares `payment` for a payable contract, or for any contract the host passes one to, and `now` when the
-   * host passes it. A contract that isn't payable refuses money attached to its call.
+   * Calls one of the contract's functions. Its arguments are evaluated in the order of its parameters, in the
+   * caller's scope, and its body runs in a scope of its own beneath the contract's top level.
    */
-  private bindLanguageBuiltins(script: Script, scope: Environment, context: { payment?: Payment | undefined; now?: number | bigint | Date | undefined }): void {
+  private async evalFnCall(expression: FnCallExpr, env: Environment): Promise<Value> {
+    const { line } = expression;
+    const fn = this.functions.get(expression.name);
+    if (!fn || !this.contractScope) {
+      throw new RuntimeError(`Unknown function '${expression.name}'`, line);
+    }
+    const byName = new Map(expression.args.map((arg) => [arg.name, arg.value]));
+    const scope = new Environment(this.contractScope);
+    for (const parameter of fn.parameters) {
+      const argExpr = byName.get(parameter.name);
+      if (argExpr === undefined) {
+        throw new RuntimeError(`Missing argument '${parameter.name}' for function '${fn.name}'`, line);
+      }
+      const value = requireData(await this.evaluate(argExpr, env), line);
+      const coerced = this.coerce(value, parameter.type, `for argument '${parameter.name}' of '${fn.name}'`, line);
+      scope.declare(parameter.name, { value: coerced, type: parameter.type, constant: true }, line);
+    }
+    this.signal?.throwIfAborted();
+    return this.execFunction(fn, scope);
+  }
+
+  /**
+   * Declares `payment` for a payable entrypoint, or for any contract the host passes one to, and `now` when the
+   * host passes it. An entrypoint that isn't payable refuses money attached to its call.
+   */
+  private bindLanguageBuiltins(
+    script: Script,
+    entry: FunctionDecl | undefined,
+    scope: Environment,
+    context: { payment?: Payment | undefined; now?: number | bigint | Date | undefined },
+  ): void {
     const declaration = script.declaration;
     const { payment, now } = context;
     if (payment !== undefined) {
@@ -458,12 +556,14 @@ export class Interpreter {
       if (amount < 0n || amount > BigInt(Number.MAX_SAFE_INTEGER)) {
         throw new RuntimeError(`The amount attached to the call must be whole micro-USD from 0 to ${Number.MAX_SAFE_INTEGER}`);
       }
-      if (amount > 0n && (declaration.kind !== 'contract' || !declaration.payable)) {
-        const name = declaration.kind === 'contract' ? [...declaration.path, declaration.name].join('.') : 'A request script';
+      if (amount > 0n && !entry?.payable) {
+        const name = declaration.kind === 'contract' && entry
+          ? `Function '${entry.name}' of contract '${[...declaration.path, declaration.name].join('.')}'`
+          : 'A request script';
         throw new RuntimeError(`${name} isn't payable, so money can't be attached to a call to it`);
       }
     }
-    if (declaration.kind === 'contract' && (declaration.payable || payment !== undefined)) {
+    if (declaration.kind === 'contract' && (entry?.payable || payment !== undefined)) {
       const { amount = 0, from = null, payees = [] } = payment ?? {};
       const value = freezeValue(objectValue(new Map<string, Value>([
         ['amount', int64Value(BigInt(amount))],
@@ -529,7 +629,8 @@ export class Interpreter {
 
   /**
    * Declares a state variable: the stored copy for its scope, converted to its declared type, or else its
-   * initializer's value. The initializer runs, and is metered, only when nothing is stored.
+   * initializer's value. The initializer runs, and is metered, only when nothing is stored. A variable the run
+   * already declared for the same scope, in another function, is the same variable: it is bound again, as is.
    */
   private async declareState(statement: VarDeclStatement, env: Environment): Promise<void> {
     const { name, line } = statement;
@@ -537,6 +638,11 @@ export class Interpreter {
       throw new RuntimeError(`State variable '${name}' needs a host that keeps contract state`, line);
     }
     const scope = statement.state?.scope ? stateScope(name, requireData(await this.evaluate(statement.state.scope, env), line), line) : null;
+    const declared = this.stateBindings.find((entry) => entry.name === name && JSON.stringify(entry.scope) === JSON.stringify(scope));
+    if (declared) {
+      env.declare(name, declared.binding, line);
+      return;
+    }
     const stored = await this.stateStore.get(name, scope);
     let value: Value;
     let type: RuntimeType;
@@ -626,15 +732,17 @@ export class Interpreter {
   }
 
   /**
-   * Binds a contract's parameters, or an event contract's event fields, which the host passes as its
-   * parameters (the event's data, as JSON).
+   * Binds the entrypoint's parameters, or an event contract handler's, which take fields of the event the host
+   * passes as the parameters (the event's data, as JSON). A handler declares each field it takes with the
+   * field's own type, and may leave fields out.
    */
   private async bindParameters(
     declaration: Declaration,
+    entry: FunctionDecl | undefined,
     parameters: Record<string, unknown> | undefined,
     env: Environment,
   ): Promise<void> {
-    if (declaration.kind === 'request') {
+    if (declaration.kind === 'request' || !entry) {
       if (parameters !== undefined && Object.keys(parameters).length > 0) {
         throw new ParameterError('A request script does not take parameters');
       }
@@ -642,21 +750,30 @@ export class Interpreter {
     }
     if (declaration.kind !== 'contract') return;
 
-    let declaredParameters: { name: string; type: RuntimeType }[] = declaration.parameters;
+    const provided = parameters ?? {};
+    let known = new Set(entry.parameters.map((parameter) => parameter.name));
     if (declaration.consumes) {
       const event = await this.resolveEvent(declaration.consumes);
-      declaredParameters = [];
-      for (const field of event.fields) {
-        declaredParameters.push({ name: field.name, type: await this.fieldType(event, field) });
+      const label = `${event.path}.${event.name}`;
+      known = new Set(event.fields.map((field) => field.name));
+      for (const parameter of entry.parameters) {
+        const field = event.fields.find((candidate) => candidate.name === parameter.name);
+        if (!field) {
+          throw new RuntimeError(`Event '${label}' has no field '${parameter.name}' for the handler to take`, entry.line);
+        }
+        const fieldType = typeToString(await this.fieldType(event, field, entry.line));
+        if (fieldType !== typeToString(parameter.type)) {
+          throw new RuntimeError(
+            `The handler takes field '${parameter.name}' as ${typeToString(parameter.type)}, but event '${label}' declares it ${fieldType}`,
+            entry.line,
+          );
+        }
       }
     }
-
-    const provided = parameters ?? {};
-    const declared = new Set(declaredParameters.map((parameter) => parameter.name));
     for (const key of Object.keys(provided)) {
-      if (!declared.has(key)) throw new ParameterError(`Unknown parameter '${key}'`);
+      if (!known.has(key)) throw new ParameterError(`Unknown parameter '${key}'`);
     }
-    for (const parameter of declaredParameters) {
+    for (const parameter of entry.parameters) {
       if (env.lookup(parameter.name)?.builtin) {
         throw new ParameterError(`Parameter '${parameter.name}' conflicts with a built-in variable`);
       }
@@ -928,6 +1045,8 @@ export class Interpreter {
       }
       case 'call':
         return this.evalCall(expression, env);
+      case 'fnCall':
+        return this.evalFnCall(expression, env);
       case 'unary': {
         const operand = await this.evaluate(expression.operand, env);
         if (expression.operator === '!') {
@@ -1246,5 +1365,5 @@ export async function interpretParsed(script: Script, options: InterpretOptions 
     options.events,
     options.structs,
   );
-  return interpreter.run(script, options.parameters, options.builtins, { payment: options.payment, now: options.now });
+  return interpreter.run(script, options.parameters, options.builtins, { payment: options.payment, now: options.now, function: options.function });
 }

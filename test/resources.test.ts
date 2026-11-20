@@ -401,11 +401,13 @@ describe('interpreter: resource versions', () => {
     functions: [{ name: 'run', parameters: [], exec: async () => answer, returnType: 'int32' }],
   });
   const resourceResolver = createResourceResolver([job('1', 10), job('2', 20), addResource]);
-  const contract = (body: string) => `contract com.example.Caller: object {\n${body}\n}`;
+  const contract = (body: string) => `contract com.example.Caller {\n  pub fn run(): object {\n${body}\n  }\n}`;
 
   it('binds the version a script names', async () => {
     expect(await runBody('const j: com.example.Job@1\nreturn j.run()', { resourceResolver })).toEqual(ok(10));
-    expect(await run(contract('const j: com.example.Job@1\nreturn j.run()'), { resourceResolver })).toEqual(ok(10));
+    expect(await run(contract('const j: com.example.Job@1\nreturn j.run()'), { function: 'run', resourceResolver })).toEqual(ok(10));
+    const topLevel = 'contract com.example.Caller {\n  const j: com.example.Job@1\n  pub fn run(): object {\n    return j.run()\n  }\n}';
+    expect(await run(topLevel, { function: 'run', resourceResolver })).toEqual(ok(10));
   });
 
   it('binds the latest version in a request that names none', async () => {
@@ -413,13 +415,13 @@ describe('interpreter: resource versions', () => {
   });
 
   it('makes a contract name the version of a versioned resource', async () => {
-    await expect(run(contract('const j: com.example.Job\nreturn j.run()'), { resourceResolver })).rejects.toThrow(
+    await expect(run(contract('const j: com.example.Job\nreturn j.run()'), { function: 'run', resourceResolver })).rejects.toThrow(
       "Resource 'com.example.Job' is versioned, so a contract must bind it by its version, e.g. 'com.example.Job@2'",
     );
   });
 
   it('lets a contract bind a resource without versions by its name', async () => {
-    expect(await run(contract('const r: path.to.AddResource\nreturn r.add(first: 1, second: 2)'), { resourceResolver })).toEqual(ok(3));
+    expect(await run(contract('const r: path.to.AddResource\nreturn r.add(first: 1, second: 2)'), { function: 'run', resourceResolver })).toEqual(ok(3));
   });
 
   it('refuses a version a resource does not have', async () => {

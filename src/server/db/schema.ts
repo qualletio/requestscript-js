@@ -6,6 +6,15 @@ export interface StoredContractParameter {
   type: string;
 }
 
+/** One of a contract's entrypoints: a `pub` function, or an event contract's handler. */
+export interface StoredContractFunction {
+  name: string;
+  parameters: StoredContractParameter[];
+  /** Requestscript type string, or 'void' for a function that returns nothing. */
+  returnType: string;
+  payable: boolean;
+}
+
 /**
  * Saved contracts. A contract is identified by (path, name, version) and is
  * immutable: changing one means saving it again under a new version.
@@ -21,8 +30,8 @@ export const contracts = pgTable(
     version: text('version').notNull().default('1'),
     /** Full Requestscript source of the contract. */
     source: text('source').notNull(),
-    /** Declared parameters, denormalized for listing and validation. */
-    parameters: jsonb('parameters').notNull().$type<StoredContractParameter[]>(),
+    /** The contract's entrypoints, denormalized for listing. */
+    functions: jsonb('functions').notNull().$type<StoredContractFunction[]>(),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => [uniqueIndex('contracts_path_name_version_unique').on(table.path, table.name, table.version)],

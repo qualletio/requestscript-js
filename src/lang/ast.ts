@@ -42,19 +42,32 @@ export interface ContractDecl {
   name: string;
   /** Declared with '@<version>' after the name — dot-separated numbers such as '2' or '1.2.3'; '1' when omitted. */
   version: string;
-  parameters: ParameterDecl[];
-  /** Declared with ': type' after the parameters. The contract's return value is checked against it. */
-  returnType?: TypeNode;
   /**
    * Declared with `consumes path.Name[@version]` after the name: an event contract, which the host runs with
-   * each event of that type. It declares no parameters or return type; the event's fields are its parameters.
+   * each event of that type. Its handler is the function `on`, whose parameters are fields of the event.
    */
   consumes?: EventRef;
+}
+
+/**
+ * `[pub] [payable] fn name(parameter: type, ...)[: type] { ... }` in a contract's body. A `pub` function is
+ * an entrypoint: the host runs the contract by naming one, and callers call it as `ref.name(...)`. Any
+ * function may call any other by its name, `name(parameter: value)`, but never itself, directly or not.
+ */
+export interface FunctionDecl {
+  name: string;
+  /** Callable from outside the contract. */
+  pub: boolean;
   /**
-   * Declared with `payable` before `contract`: the contract accepts money attached to a call, and reads it as
-   * the built-in `payment`. Set only when true. An event contract can't be payable, since nobody calls it.
+   * Declared with `pub payable fn`: the entrypoint accepts money attached to a call, and the run reads it as
+   * the built-in `payment`. Only a `pub` function can be payable.
    */
-  payable?: true;
+  payable: boolean;
+  parameters: ParameterDecl[];
+  /** Declared with ': type' after the parameters. Without one the function returns nothing (null). */
+  returnType?: TypeNode;
+  body: Statement[];
+  line: number;
 }
 
 /** A reference to an event type: `path.Name`, optionally `@version`. */
@@ -96,7 +109,13 @@ export type Declaration = RequestDecl | ContractDecl | EventDecl | StructDecl;
 
 export interface Script {
   declaration: Declaration;
+  /**
+   * A request script's statements. In a contract, its top-level declarations, in source order: `var state`
+   * variables and `const` resource bindings, which run before the entrypoint every time the contract runs.
+   */
   body: Statement[];
+  /** A contract's functions, in source order. Empty for every other script. */
+  functions: FunctionDecl[];
 }
 
 // ---------- Statements ----------
@@ -104,7 +123,8 @@ export interface Script {
 // Every statement and expression carries `tokens`: the number of lexer tokens
 // it owns, excluding the tokens owned by its child nodes, so summing `tokens`
 // over a set of nodes never counts a token twice. Tokens outside any node (the
-// declaration, its parameter list and the body's braces) are owned by none.
+// declaration, the contract body's braces and each function's signature and
+// braces) are owned by none.
 // Script metering charges a node's `tokens` when the node executes.
 
 export interface VarDeclStatement {
@@ -114,7 +134,7 @@ export interface VarDeclStatement {
   type?: TypeNode;
   value: Expression;
   /**
-   * Set for `var state name = ...` or `var state(scope) name = ...` at the top level of a contract: a value
+   * Set for `var state name = ...` or `var state(scope) name = ...` at a contract's top level: a value
    * the host keeps between invocations, one per value of `scope` when it has one.
    */
   state?: { scope?: Expression };
@@ -324,6 +344,18 @@ export interface CallExpr {
   tokens: number;
 }
 
+/**
+ * A call to one of the contract's own functions: `name(parameter: value, ...)`. It evaluates to what the
+ * function returns, not to a `{ value, error }` result, and a failure in it fails the run.
+ */
+export interface FnCallExpr {
+  kind: 'fnCall';
+  name: string;
+  args: NamedArgument[];
+  line: number;
+  tokens: number;
+}
+
 export type UnaryOperator = '!' | '-';
 
 export interface UnaryExpr {
@@ -370,5 +402,6 @@ export type Expression =
   | MemberExpr
   | IndexExpr
   | CallExpr
+  | FnCallExpr
   | UnaryExpr
   | BinaryExpr;
