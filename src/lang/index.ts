@@ -1,7 +1,8 @@
 export * from './ast.js';
 export { Decimal, DecimalArithmeticError } from './decimal.js';
+export { builtinReads } from './builtins.js';
 export { emittedEvents } from './events.js';
-export { entrypoint, entrypoints, EVENT_HANDLER, walkStatements } from './functions.js';
+export { entrypoint, entrypoints, EVENT_HANDLER, RENDER_FUNCTION, walkStatements } from './functions.js';
 export {
   createStructResolver,
   MAX_STRUCT_DEPTH,
@@ -26,6 +27,9 @@ export {
   type EventType,
   type InterpretOptions,
   type InterpretResult,
+  type ActionHandle,
+  type SessionStore,
+  type SessionWrite,
   type StateScope,
   type StateStore,
   type StateWrite,
@@ -55,3 +59,14 @@ export { compareVersions } from './versions.js';
 export { decodeValue, encodeValue, typeToString, valueToJson, type EncodedValue, type ResolvedStruct, type RuntimeType, type StructTable } from './types.js';
 export type { Value } from './values.js';
 export type { StringPart, Token, TokenType } from './token.js';
+export {
+  COMPONENTS,
+  isComponent,
+  MODIFIERS,
+  ROOT_VIEW,
+  type ComponentSpec,
+  type ModifierSpec,
+  type ViewArgumentType,
+  type ViewNode,
+} from './views.js';
+export { childExpressions, walkExpressions } from './walk.js';

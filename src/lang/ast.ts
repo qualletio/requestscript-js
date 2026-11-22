@@ -105,7 +105,20 @@ export interface StructDecl {
   fields: ParameterDecl[];
 }
 
-export type Declaration = RequestDecl | ContractDecl | EventDecl | StructDecl;
+/**
+ * `rendering path.Name[@version] { ... }`: an app the host serves (SIP-2). Its body holds `var state` and
+ * `protected var` variables, pinned resource bindings, private functions and one entrypoint, `pub fn render()`,
+ * which builds the UI from components. Components' actions are lambdas the host runs later, each in a run of
+ * its own (see `InterpretOptions.action`).
+ */
+export interface RenderingDecl {
+  kind: 'rendering';
+  path: string[];
+  name: string;
+  version: string;
+}
+
+export type Declaration = RequestDecl | ContractDecl | EventDecl | StructDecl | RenderingDecl;
 
 export interface Script {
   declaration: Declaration;
@@ -114,8 +127,10 @@ export interface Script {
    * variables and `const` resource bindings, which run before the entrypoint every time the contract runs.
    */
   body: Statement[];
-  /** A contract's functions, in source order. Empty for every other script. */
+  /** A contract's or rendering's functions, in source order. Empty for every other script. */
   functions: FunctionDecl[];
+  /** A rendering's lambdas, in source order: each one's `index` is its place here. Omitted for other scripts. */
+  lambdas?: LambdaExpr[];
 }
 
 // ---------- Statements ----------
@@ -138,6 +153,11 @@ export interface VarDeclStatement {
    * the host keeps between invocations, one per value of `scope` when it has one.
    */
   state?: { scope?: Expression };
+  /**
+   * Set for `protected var name = ...` at a rendering's top level: a value the host keeps for one viewer's
+   * session, never shared and never saved as state (see `InterpretOptions.session`).
+   */
+  protected?: true;
   line: number;
   tokens: number;
 }
@@ -161,6 +181,8 @@ export interface AssignStatement {
   kind: 'assign';
   target: IdentifierExpr | MemberExpr | IndexExpr;
   value: Expression;
+  /** Set for `target += value` and `target -= value`: the value is added to, or taken from, the target's. */
+  operator?: '+' | '-';
   line: number;
   tokens: number;
 }
@@ -389,7 +411,45 @@ export interface BinaryExpr {
   tokens: number;
 }
 
+/**
+ * `(parameter: type, ...) => { ... }`, written only as a component's action argument. It doesn't run where it is
+ * written: a render returns it as an action handle, and the host runs its body later, in a run of its own.
+ */
+export interface LambdaExpr {
+  /** Its place in the script's `lambdas`, which an action handle names. */
+  index: number;
+  parameters: ParameterDecl[];
+  body: Statement[];
+  /**
+   * The names its body reads that it doesn't declare. The render captures the values of those that are the
+   * render's own locals, so the action sees them as they were.
+   */
+  names: string[];
+  line: number;
+  /** Its parameter list, `=>` and braces. Not charged where it is written; an action run charges its body. */
+  tokens: number;
+}
+
+/** An argument of a component: a value, or for an action argument, a lambda. */
+export type ViewArgument = { name: string; value: Expression } | { name: string; lambda: LambdaExpr };
+
+/**
+ * A component in a rendering, `Name`, `Name(argument: value, ...)`, optionally followed by `{ ... }` holding its
+ * children: every component written in the block is added to it, in order. Modifiers are calls on it,
+ * `Text(str: "x").color(of: "blue")`. Components are only built while rendering.
+ */
+export interface ViewExpr {
+  kind: 'view';
+  component: string;
+  args: ViewArgument[];
+  /** The statements of its trailing block, for components that take children. */
+  children?: Statement[];
+  line: number;
+  tokens: number;
+}
+
 export type Expression =
+  | ViewExpr
   | IntLiteralExpr
   | DecimalLiteralExpr
   | BooleanLiteralExpr

@@ -118,13 +118,13 @@ Invoked with `{ "function": "total", "parameters": { "item": { "price": 9.99, "q
 - **Comments** start with `//` and run to the end of the line.
 - **Whitespace and newlines** are insignificant, and statements need no separator (`var a = 1 var b = 2` is valid). The one exception is `return`: its value must start on the same line as the keyword, otherwise the `return` is bare.
 - **Identifiers** are `[A-Za-z_][A-Za-z0-9_]*` and are case-sensitive.
-- **Reserved keywords**: `request`, `contract`, `var`, `const`, `return`, `if`, `else`, `true`, `false`, `null`, `fn`, `pub`. Type names (`int32`, `string`, ...) are not reserved.
+- **Reserved keywords**: `request`, `contract`, `var`, `const`, `return`, `if`, `else`, `true`, `false`, `null`, `fn`, `pub`. Type names (`int32`, `string`, ...) are not reserved, and neither are the words that start other declarations and statements (`rendering`, `protected`, `state`, `emit`, `fail`, `event`, `struct`, `payable`, ...): each has its meaning only where it is written.
 - **Number literals** are decimal digits, optionally with a fractional part: `42`, `3.14`. There are no exponent, hex, or digit-separator forms, and a leading `.` (`.5`) is not a number. Negative numbers are written with unary minus (`-5`).
 - **String literals** use double quotes only and must fit on one line. Supported escapes are `\"`, `\\`, `\n`, `\t`, `\r`, and `\$`; any other escape is an error.
 
 ### Scripts and declarations
 
-Every script is exactly one declaration followed by a `{ ... }` body, except an [event](#events) or [struct](#structs) declaration, which has none. Nothing may come before or after it except comments.
+Every script is exactly one declaration followed by a `{ ... }` body, except an [event](#events) or [struct](#structs) declaration, which has none. A [rendering](#renderings) is an app built from components. Nothing may come before or after it except comments.
 
 **Request** scripts are one-off and take no parameters:
 
@@ -382,6 +382,74 @@ const result = await interpret(source, { structs, parameters });
 - `structReferences(script)` lists the structs a script names directly, for a host to check before it accepts the script. `typeStructReferences(type)` does the same for one parsed type.
 - `struct` isn't a reserved word: it acts as a keyword only at the start of a script, before a name.
 
+### Renderings
+
+A **rendering** is an app built entirely in RequestScript ([SIP-2](https://github.com/qualletio/SIPs/blob/main/SIPs/SIP-2_rendering.md)). Its one entrypoint, `pub fn render()`, builds the UI from components, and the components' actions are lambdas the host runs when the viewer uses them:
+
+```
+rendering com.example.CountUp@1 {
+    var state("count") count = 0
+
+    fn increaseCount() {
+        count += 1
+    }
+
+    pub fn render() {
+        Column {
+            Text(str: "Count: ${count}")
+                .color(of: "blue")
+
+            Button(label: "Up", action: () => { increaseCount() })
+        }
+    }
+}
+```
+
+**The body.** The declaration is named like a contract (`path.Name@version`). Its body holds only `var state` variables, `protected var` variables, resource bindings, private functions and `pub fn render()`, which takes no parameters and has no return type. It may declare no other `pub fn`, a plain top-level `var` is an error (write `var state`, shared by every viewer, or `protected var`, kept per viewer), and it can't `emit` events or attach money to calls. Its functions can't recurse, as a contract's can't.
+
+**Protected variables.** `protected var name = value` declares a value kept for one viewer's session. The host passes a `SessionStore` as `session`, which works like `state` without scopes, and the run returns the final values in `result.session`. They follow the same type rules as state variables.
+
+**Components.** A capitalized component name builds a component: `Name`, or `Name(argument: value, ...)` when it takes arguments, all of which are required. `Column` and `Row` take a trailing `{ ... }` block of children: each component written as a statement in the block is added to it, in order, and the block may use `if`/`else` and declare locals. A function `render` calls adds the components it writes where it is called. In a rendering, component names can't name anything else.
+
+| Component | Arguments | Children |
+|---|---|---|
+| `Page` | none | no |
+| `Column`, `Row` | none | yes |
+| `Text` | `str: string` | no |
+| `Button` | `label: string`, `action: () => {}` | no |
+| `TextField` | `placeholder: string`, `action: (text: string) => {}` | no |
+| `Image` | `str: string` (an http or https url) | no |
+| `Link` | `to: string` (an http or https url), `text: string` | no |
+
+**Modifiers** are calls on a component, and chain: `Text(str: "x").color(of: "blue").fontSize(size: 20)`. Each takes one argument, and the last of each wins. A null value leaves the modifier unset.
+
+| Modifier | Argument | Components |
+|---|---|---|
+| `title` | `str: string` | `Page` |
+| `color` | `of`: a color name or hex color | `Text`, `Button`, `Link` |
+| `backgroundColor` | `of`: a color | all but `Page` |
+| `fontSize` | `size`: 1 to 200 | `Text`, `Button`, `Link`, `TextField` |
+| `width`, `height`, `padding` | `of`: a size (`12px`, `50%`, `1.5rem`, `2em`, `0`) | all but `Page` |
+| `border` | `of`: a size, optionally followed by a color (`1px #e5e7eb`) | all but `Page` |
+| `enabled` | `is: boolean` | `Button`, `TextField` |
+
+A value outside these is a runtime error, so a host never draws one. The registry is exported as `COMPONENTS` and `MODIFIERS`.
+
+**Rendering.** A host runs `render` with `function: 'render'`. The result's `view` is the UI tree, as `ViewNode`s (`{ type, props, modifiers, actions, children }`, rooted at a node of type `Root`), and `actions` lists an `ActionHandle` for each lambda it wrote: `{ id, lambda, captures }`, where a node's `actions` maps its action argument to a handle's `id`. A render changes nothing: `render` and the functions it calls can't call resources or assign state or protected variables (a parse error), and a render's run returns no state or session writes.
+
+**Actions.** A lambda, `(parameter: type, ...) => { ... }`, is written only as a component's action argument. It declares the parameters the component passes (`TextField` passes its text, as a string, whatever the lambda names it) or none, and returns nothing. The render captures the values of its own locals that the lambda reads, so an action sees them as they were. The host runs an action with `action: { lambda, captures, args }`: the rendering's top level runs, then the lambda's body, which may call resources and change state and protected variables, and the result carries the writes. `onBeforeInvoke` is called before each resource call once the run has changed a state or protected variable, with their values, so a host can show a render with them (a loading state) while the call runs.
+
+```ts
+import { interpret } from "requestscript";
+
+const rendered = await interpret(source, { function: "render", state, session, builtins: { signIn, queryParams } });
+const handle = rendered.actions!.find((action) => action.id === "0")!;
+const acted = await interpret(source, { action: { lambda: handle.lambda, captures: handle.captures, args: [] }, state, session });
+save(acted.state, acted.session); // then render again
+```
+
+The host supplies a rendering's other inputs as [built-in variables](#built-in-variables), such as `signIn`, `queryParams` and `headers`. `builtinReads(script, "signIn")` lists the properties a script reads of one (`{ fields: ["id", "name"], whole: false }`), so a host can ask a viewer to share only those.
+
 ### Expressions
 
 **Literals**: numbers, strings, `true`, `false`, `null`, objects, and lists.
@@ -425,12 +493,12 @@ Parentheses group as usual. Operator semantics:
 - **Decimal arithmetic** happens when either side is a `decimal`. Addition, subtraction, and multiplication are exact. Division rounds half away from zero at 10 decimal places, or at the larger operand's scale if that is greater (`1 / 3.0` is `0.3333333333`).
 - Dividing by zero is an error for both integers and decimals.
 
-There is no modulo operator, no compound assignment (`+=`), and no increment/decrement operator.
+There is no modulo operator and no increment/decrement operator.
 
 ### Statements
 
 - **Declarations**: `var` and `const`, as above.
-- **Assignment**: `name = value`, `obj.prop = value`, `list[i] = value`.
+- **Assignment**: `name = value`, `obj.prop = value`, `list[i] = value`. `target += value` and `target -= value` add to and take from the target, as `target = target + value` would (so `+=` on a string appends), finding the target once.
 - **Expression statements**: any expression on its own, which is mostly useful for calling a resource function for its side effect.
 - **`if` / `else if` / `else`**: the condition must be in parentheses and the bodies in braces. Each body is its own scope.
 
@@ -606,6 +674,7 @@ Each statement and expression owns the tokens it was parsed from, minus those ow
 - The operand a short-circuiting `&&` or `||` skips is not counted.
 - A string counts as one token, plus the tokens of each `${}` interpolation as it is evaluated.
 - Parentheses count with the expression that encloses them, and an assignment's target counts with the assignment.
+- In a [rendering](#renderings), a component counts its name, arguments and braces, then its children as they run. A lambda counts nothing where it is written: an action run counts the rendering's top level and the lambda's body.
 
 ```ts
 import { interpret, maxTokens, parseScript, TokenMeter } from "requestscript-js";
@@ -613,6 +682,7 @@ import { interpret, maxTokens, parseScript, TokenMeter } from "requestscript-js"
 const script = parseScript(source);
 maxTokens(script); // the most any run can execute: each if takes its costliest path
 maxTokens(script, "add"); // a contract's top level plus its entrypoint `add`, with the functions it calls
+maxTokens(script, { action: 0 }); // a rendering's top level plus the body of its first lambda
 // Without a name, a contract's bound is its costliest entrypoint's.
 
 const meter = new TokenMeter(10_000); // optional limit
@@ -633,7 +703,7 @@ Entrypoint parameters arrive as JSON and are converted to their declared types. 
 Interpreter failures are thrown as typed errors, which the server maps to HTTP status codes:
 
 - `LexError` and `ParseError` (HTTP `400`) cover malformed source: unknown characters, unterminated strings, unknown types, duplicate keys or parameters, a missing declaration, and so on. They carry a line and column.
-- `ParameterError` (HTTP `400`) is raised for missing, unknown, or wrongly-typed entrypoint parameters. Its subclass `EntrypointError` is raised when the host names no entrypoint of a contract, or one the contract doesn't have or doesn't make `pub`.
+- `ParameterError` (HTTP `400`) is raised for missing, unknown, or wrongly-typed entrypoint parameters, and for a rendering action's captures and arguments. Its subclass `EntrypointError` is raised when the host names no entrypoint of a contract, or one the contract doesn't have or doesn't make `pub`, or a rendering action the rendering doesn't have.
 - `RuntimeError` (HTTP `422`) covers everything detected while running: type mismatches, unknown variables, redeclaration, assigning to a `const`, overflow, division by zero, out-of-bounds indexes, non-boolean conditions, and passing a meter's token limit (`TokenLimitError`). It carries a line number.
 - `ScriptFailure` (a `RuntimeError`, HTTP `422`) is a script failing on purpose with `fail`. Its `reason` is the script's message.
 

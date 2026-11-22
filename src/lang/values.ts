@@ -1,5 +1,6 @@
 import type { Decimal } from './decimal.js';
 import type { Resource } from './resource.js';
+import type { ViewNode } from './views.js';
 
 export const INT32_MIN = -2147483648n;
 export const INT32_MAX = 2147483647n;
@@ -17,7 +18,9 @@ export type Value =
   | { kind: 'list'; elements: Value[]; readonly?: true }
   | { kind: 'object'; entries: Map<string, Value>; readonly?: true }
   /** `version` is the one the script wrote when it bound the resource, `const r: path.Name@version`. */
-  | { kind: 'resource'; resource: Resource; version?: string };
+  | { kind: 'resource'; resource: Resource; version?: string }
+  /** A component a rendering built, with its arguments, modifiers and children already checked. */
+  | { kind: 'view'; node: ViewNode };
 
 export const NULL_VALUE: Value = { kind: 'null' };
 

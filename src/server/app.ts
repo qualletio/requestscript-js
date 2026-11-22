@@ -170,6 +170,10 @@ export function createApp(options: AppOptions): Express {
       const source = typeof req.body === 'string' ? req.body : '';
       try {
         const script = parseScript(source);
+        if (script.declaration.kind === 'rendering') {
+          sendError(res, 400, 'InvalidScript', 'This server doesn\'t serve renderings; a host such as a Stellarium node does');
+          return;
+        }
         if (script.declaration.kind !== 'contract') {
           sendError(res, 400, 'InvalidScript', 'POST /contracts saves contract scripts; run request scripts via POST /run');
           return;
