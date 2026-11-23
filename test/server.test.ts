@@ -187,6 +187,12 @@ describe('POST /contracts', () => {
     expect((await request(app).post('/run/b/C').send({ function: 'run' })).body).toEqual({ returnValue: 'b' });
   });
 
+  it('rejects renderings, which it doesn\'t serve', async () => {
+    const response = await postScript('/contracts', 'rendering a.B {\n  pub fn render() {\n    Text(str: "x")\n  }\n}');
+    expect(response.status).toBe(400);
+    expect(response.body.error.message).toContain("doesn't serve renderings");
+  });
+
   it('rejects request scripts', async () => {
     const response = await postScript('/contracts', 'request R { return 1 }');
     expect(response.status).toBe(400);

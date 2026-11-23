@@ -13,7 +13,9 @@ import {
   type EventType,
   interpretParsed,
   type InterpretResult,
+  type ActionHandle,
   type ResourceInvoker,
+  type SessionWrite,
   type StateScope,
   type StateWrite,
   type StoredState,
@@ -22,6 +24,8 @@ import { TokenMeter } from '../lang/meter.js';
 import { parseScript } from '../lang/parser.js';
 import type { Resource, ResourceFunctionCallParameter } from '../lang/resource.js';
 import { createStructResolver, type StructType } from '../lang/structs.js';
+import type { EncodedValue } from '../lang/types.js';
+import type { ViewNode } from '../lang/views.js';
 import { CONFORMANCE_CASES } from './cases.js';
 
 export { CONFORMANCE_CASES } from './cases.js';
@@ -47,6 +51,10 @@ export interface ConformanceCase {
   source: string;
   /** The entrypoint a contract case runs. Omitted for a request script or an event contract. */
   function?: string;
+  /** The rendering action a case runs instead of an entrypoint. */
+  action?: { lambda: number; captures?: Record<string, EncodedValue>; args?: unknown[] };
+  /** Stored protected variables of the viewer's session, by name. */
+  session?: { name: string; stored: StoredState }[];
   parameters?: Record<string, unknown>;
   builtins?: Record<string, unknown>;
   payment?: { amount: number; from: string | null; payees: string[] };
@@ -70,6 +78,11 @@ export interface ConformanceCase {
     state?: StateWrite[];
     /** Omitted: no events. Ignored when the run fails. */
     events?: EmittedEvent[];
+    /** Omitted: no protected writes. Ignored when the run fails. */
+    session?: SessionWrite[];
+    /** A render's UI and actions. Omitted for every other run. Ignored when the run fails. */
+    view?: ViewNode;
+    actions?: ActionHandle[];
   };
 }
 
@@ -81,6 +94,9 @@ export interface ConformanceOutcome {
   calls: ConformanceCall[];
   state: StateWrite[];
   events: EmittedEvent[];
+  session: SessionWrite[];
+  view?: ViewNode;
+  actions?: ActionHandle[];
 }
 
 export interface ConformanceFailure {
@@ -127,6 +143,7 @@ export async function runConformanceCase(testCase: ConformanceCase): Promise<Con
   };
   const stored = new Map((testCase.state ?? []).map((entry) => [JSON.stringify([entry.name, entry.scope]), entry.stored]));
   const eventTypes = testCase.events ?? [];
+  const session = new Map((testCase.session ?? []).map((entry) => [entry.name, entry.stored]));
   const meter = new TokenMeter();
   let result: InterpretResult | undefined;
   let error: { type: string; message: string } | undefined;
@@ -136,6 +153,8 @@ export async function runConformanceCase(testCase: ConformanceCase): Promise<Con
       resourceInvoker,
       meter,
       ...(testCase.function === undefined ? {} : { function: testCase.function }),
+      ...(testCase.action === undefined ? {} : { action: testCase.action }),
+      session: { get: async (name) => session.get(name) },
       ...(testCase.parameters === undefined ? {} : { parameters: testCase.parameters }),
       ...(testCase.builtins === undefined ? {} : { builtins: testCase.builtins }),
       ...(testCase.payment === undefined ? {} : { payment: testCase.payment }),
@@ -158,6 +177,9 @@ export async function runConformanceCase(testCase: ConformanceCase): Promise<Con
     calls,
     state: result?.state ?? [],
     events: result?.events ?? [],
+    session: result?.session ?? [],
+    ...(result?.view ? { view: result.view } : {}),
+    ...(result?.actions ? { actions: result.actions } : {}),
   };
 }
 
@@ -176,6 +198,9 @@ export function conformanceDifferences(testCase: ConformanceCase, outcome: Confo
   if (!outcome.error) {
     compare('state', expect.state ?? [], outcome.state);
     compare('events', expect.events ?? [], outcome.events);
+    compare('session', expect.session ?? [], outcome.session);
+    compare('view', expect.view, outcome.view);
+    compare('actions', expect.actions, outcome.actions);
   }
   return differences;
 }

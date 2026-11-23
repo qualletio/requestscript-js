@@ -13,9 +13,11 @@ import type {
   FunctionDecl,
   IfBranch,
   IfStatement,
+  LambdaExpr,
   MemberExpr,
   NamedArgument,
   ParameterDecl,
+  RenderingDecl,
   Script,
   Statement,
   StructDecl,
@@ -23,26 +25,34 @@ import type {
   TemplatePart,
   TypeNode,
   VarDeclStatement,
+  ViewArgument,
+  ViewExpr,
 } from './ast.js';
 import { ParseError } from './errors.js';
-import { EVENT_HANDLER } from './functions.js';
+import { EVENT_HANDLER, RENDER_FUNCTION } from './functions.js';
 import { tokenize } from './lexer.js';
 import { typeToString } from './types.js';
 import type { Token, TokenType } from './token.js';
+import { COMPONENTS, isComponent, MODIFIERS, type ComponentSpec, type ViewArgumentType } from './views.js';
+import { childExpressions, statementBlocks, statementExpressions, walkExpressions, walkNestedStatements as walkStatementsIn } from './walk.js';
 
 const BUILTIN_TYPE_NAMES = new Set(['int32', 'int64', 'decimal', 'boolean', 'string', 'object']);
 
 export class Parser {
   private pos = 0;
   /** What is being parsed, and how many blocks deep: state variables are only allowed at a contract's top level. */
-  private declarationKind: 'request' | 'contract' | undefined;
+  private declarationKind: 'request' | 'contract' | 'rendering' | undefined;
   /** Set while parsing an event contract's body. */
   private consumer = false;
   private depth = 0;
   /** The function whose body is being parsed, if any: a function without a return type can't return a value. */
   private currentFunction: FunctionDecl | undefined;
   /** Every call to one of the contract's functions, with the function it is in, resolved once all are parsed. */
-  private fnCalls: { call: FnCallExpr; caller: FunctionDecl | undefined }[] = [];
+  private fnCalls: { call: FnCallExpr; caller: FunctionDecl | undefined; inLambda: boolean }[] = [];
+  /** A rendering's lambdas, in source order, shared with the parsers of string interpolations. */
+  private lambdas: LambdaExpr[] = [];
+  /** How many lambda bodies deep the parser is. */
+  private lambdaDepth = 0;
   /** Each node's full token span, children included, so a parent can work out the tokens it owns. */
   private readonly spans = new WeakMap<object, number>();
 
@@ -133,13 +143,52 @@ export class Parser {
       const { body, functions } = this.parseContractBody(declaration);
       return { declaration, body, functions };
     }
+    if (this.atRenderingDecl()) {
+      this.advance(); // rendering
+      this.declarationKind = 'rendering';
+      const declaration = this.parseRenderingDecl();
+      const { body, functions } = this.parseContractBody(declaration);
+      return { declaration, body, functions, lambdas: this.lambdas };
+    }
     if (this.atEventDecl()) {
       return { declaration: this.parseEventDecl(), body: [], functions: [] };
     }
     if (this.atStructDecl()) {
       return { declaration: this.parseStructDecl(), body: [], functions: [] };
     }
-    throw this.error(`A script must start with 'request', 'contract', 'event' or 'struct'`);
+    throw this.error(`A script must start with 'request', 'contract', 'rendering', 'event' or 'struct'`);
+  }
+
+  /** `rendering` is not a keyword: it starts a rendering only at the start of a script, before a name. */
+  private atRenderingDecl(): boolean {
+    return this.peek().type === 'identifier' && this.peek().value === 'rendering' && isPathWord(this.peek(1)) && this.peek(1).type !== 'eof';
+  }
+
+  private parseRenderingDecl(): RenderingDecl {
+    const { path, name } = this.parsePath('rendering');
+    const version = this.match('@') ? this.parseContractVersion('rendering') : '1';
+    if (this.check('(')) {
+      throw this.error(`A rendering takes no parameters: its UI is built by 'pub fn ${RENDER_FUNCTION}()'`);
+    }
+    if (this.check(':')) {
+      throw this.error('A rendering has no return type');
+    }
+    if (this.check('identifier') && this.peek().value === 'consumes') {
+      throw this.error('A rendering can\'t consume events');
+    }
+    return { kind: 'rendering', path, name, version };
+  }
+
+  /** `protected` is not a keyword: it marks a variable only right before `var`. */
+  private atProtected(): boolean {
+    return this.peek().type === 'identifier' && this.peek().value === 'protected' && this.peek(1).type === 'var';
+  }
+
+  /** A rendering can't use a component's name for anything else, since that name always builds the component. */
+  private checkName(name: string, what: string, token?: Token): void {
+    if (this.declarationKind === 'rendering' && isComponent(name)) {
+      throw this.error(`'${name}' is a component, so it can't be the name of a ${what}`, token);
+    }
   }
 
   /** `struct` is not a keyword: it starts a struct declaration only at the start of a script, before a name. */
@@ -251,14 +300,16 @@ export class Parser {
    * `{ ... }` after a contract's declaration: its `var state` variables, `const` resource bindings and
    * functions, in any order. Nothing else may appear outside a function.
    */
-  private parseContractBody(declaration: ContractDecl): { body: Statement[]; functions: FunctionDecl[] } {
-    this.expect('{', 'to start the contract body');
+  private parseContractBody(declaration: ContractDecl | RenderingDecl): { body: Statement[]; functions: FunctionDecl[] } {
+    const rendering = declaration.kind === 'rendering';
+    const what = rendering ? 'rendering' : 'contract';
+    this.expect('{', `to start the ${what} body`);
     this.depth++;
     const body: Statement[] = [];
     const functions: FunctionDecl[] = [];
     while (!this.check('}')) {
       const token = this.peek();
-      if (token.type === 'eof') throw this.error(`Expected '}' to close the contract body`);
+      if (token.type === 'eof') throw this.error(`Expected '}' to close the ${what} body`);
       if (this.atFunction()) {
         const fn = this.parseFunction();
         if (functions.some((other) => other.name === fn.name)) {
@@ -267,22 +318,40 @@ export class Parser {
         functions.push(fn);
         continue;
       }
+      if (!rendering && this.atProtected()) {
+        throw this.error('Protected variables can only be declared in a rendering');
+      }
+      if (rendering && this.atProtected()) {
+        this.advance(); // protected
+        body.push(this.parseVarDecl(false, true));
+        continue;
+      }
       if (token.type === 'var' || token.type === 'const') {
         const statement = this.parseVarDecl(token.type === 'const');
         if (statement.kind === 'resourceDecl' || (statement.kind === 'varDecl' && statement.state)) {
           body.push(statement);
           continue;
         }
+        if (rendering && statement.kind === 'varDecl' && !statement.constant) {
+          throw new ParseError(
+            `A rendering's top-level variables are 'var state', shared by every viewer, or 'protected var', kept for each viewer's session: write one of them for '${statement.name}'`,
+            token.line,
+            token.column,
+          );
+        }
       }
       throw new ParseError(
-        `Outside its functions a contract declares only state variables ('var state'), resource bindings ('const r: path.Name@version') and functions ('fn')`,
+        rendering
+          ? `Outside its functions a rendering declares only state variables ('var state'), protected variables ('protected var'), resource bindings ('const r: path.Name@version') and functions ('fn')`
+          : `Outside its functions a contract declares only state variables ('var state'), resource bindings ('const r: path.Name@version') and functions ('fn')`,
         token.line,
         token.column,
       );
     }
-    this.expect('}', 'to end the contract body');
+    this.expect('}', `to end the ${what} body`);
     this.depth--;
     this.checkFunctions(declaration, body, functions);
+    if (rendering) this.checkRender(body, functions);
     return { body, functions };
   }
 
@@ -304,7 +373,9 @@ export class Parser {
       payable = true;
     }
     this.expect('fn', pub ? `after '${payable ? 'pub payable' : 'pub'}'` : 'to declare a function');
-    const name = this.expect('identifier', 'as the function name').value;
+    const nameToken = this.expect('identifier', 'as the function name');
+    const name = nameToken.value;
+    this.checkName(name, 'function', nameToken);
     const parameters = this.check('(')
       ? this.parseParameterList(true)
       : (() => { throw this.error(`Function '${name}' needs a parameter list, e.g. '${name}()'`); })();
@@ -321,10 +392,28 @@ export class Parser {
    * The rules that need the whole contract: its entrypoints, the names its functions' parameters may take,
    * and every call to its functions, which must name one, pass its parameters, and never lead back to itself.
    */
-  private checkFunctions(declaration: ContractDecl, body: Statement[], functions: FunctionDecl[]): void {
+  private checkFunctions(declaration: ContractDecl | RenderingDecl, body: Statement[], functions: FunctionDecl[]): void {
     const label = [...declaration.path, declaration.name].join('.');
     const handler = functions.find((fn) => fn.name === EVENT_HANDLER);
-    if (declaration.consumes) {
+    if (declaration.kind === 'rendering') {
+      const render = functions.find((fn) => fn.name === RENDER_FUNCTION);
+      if (!render || !render.pub) {
+        throw this.error(`Rendering '${label}' needs its entrypoint: 'pub fn ${RENDER_FUNCTION}() { ... }'`);
+      }
+      if (render.payable) {
+        throw new ParseError(`'${RENDER_FUNCTION}' builds the UI, so it isn't payable`, render.line);
+      }
+      if (render.parameters.length > 0) {
+        throw new ParseError(`'${RENDER_FUNCTION}' takes no parameters: read 'queryParams' and the other built-ins instead`, render.line);
+      }
+      if (render.returnType) {
+        throw new ParseError(`'${RENDER_FUNCTION}' has no return type: the components it writes are the UI`, render.line);
+      }
+      const other = functions.find((fn) => fn.pub && fn.name !== RENDER_FUNCTION);
+      if (other) {
+        throw new ParseError(`A rendering's only entrypoint is '${RENDER_FUNCTION}', so function '${other.name}' can't be pub`, other.line);
+      }
+    } else if (declaration.consumes) {
       if (!handler) {
         throw this.error(`Event contract '${label}' needs a handler: 'fn ${EVENT_HANDLER}(field: type, ...) { ... }'`);
       }
@@ -389,8 +478,11 @@ export class Parser {
       if (!fn) {
         throw new ParseError(`Unknown function '${call.name}'`, call.line);
       }
-      if (declaration.consumes && fn.name === EVENT_HANDLER) {
+      if (declaration.kind === 'contract' && declaration.consumes && fn.name === EVENT_HANDLER) {
         throw new ParseError(`The handler '${EVENT_HANDLER}' runs with each event; it can't be called`, call.line);
+      }
+      if (declaration.kind === 'rendering' && fn.name === RENDER_FUNCTION) {
+        throw new ParseError(`'${RENDER_FUNCTION}' is run by the host; it can't be called`, call.line);
       }
       const declared = new Set(fn.parameters.map((parameter) => parameter.name));
       for (const arg of call.args) {
@@ -411,13 +503,62 @@ export class Parser {
     const visit = (name: string, chain: string[]): void => {
       if (chain.includes(name)) {
         const cycle = [...chain.slice(chain.indexOf(name)), name].join(' -> ');
-        throw new ParseError(`Function '${name}' calls itself, which a contract can't do: ${cycle}`, byName.get(name)!.line);
+        throw new ParseError(`Function '${name}' calls itself, which a ${declaration.kind} can't do: ${cycle}`, byName.get(name)!.line);
       }
       if (done.has(name)) return;
       for (const callee of callees.get(name)!) visit(callee, [...chain, name]);
       done.add(name);
     };
     for (const fn of functions) visit(fn.name, []);
+  }
+
+  /**
+   * `render` and every function it calls build the UI and nothing else: they read state, protected variables
+   * and built-ins, but call no resources and assign no state or protected variables. Only actions, the bodies
+   * of lambdas, may. So a render changes nothing, and the host can run it whenever it needs the UI.
+   */
+  private checkRender(body: Statement[], functions: FunctionDecl[]): void {
+    const kept = new Set<string>();
+    const declared = (statements: Statement[]): void => {
+      for (const statement of statements) {
+        if (statement.kind === 'varDecl' && (statement.state || statement.protected)) kept.add(statement.name);
+      }
+    };
+    declared(body);
+    for (const fn of functions) declared(fn.body);
+
+    const byName = new Map(functions.map((fn) => [fn.name, fn]));
+    const reachable: FunctionDecl[] = [];
+    const visit = (fn: FunctionDecl): void => {
+      if (reachable.includes(fn)) return;
+      reachable.push(fn);
+      for (const { call, caller, inLambda } of this.fnCalls) {
+        if (caller === fn && !inLambda) visit(byName.get(call.name)!);
+      }
+    };
+    visit(byName.get(RENDER_FUNCTION)!);
+
+    const where = (fn: FunctionDecl) => (fn.name === RENDER_FUNCTION ? `'${RENDER_FUNCTION}'` : `function '${fn.name}', which '${RENDER_FUNCTION}' calls,`);
+    for (const fn of reachable) {
+      const statement = (node: Statement): void => {
+        if (node.kind === 'assign') {
+          const root = rootName(node.target);
+          if (root !== undefined && kept.has(root)) {
+            throw new ParseError(`${capitalize(where(fn))} can't change '${root}': only actions change state and protected variables`, node.line);
+          }
+        }
+        for (const child of statementExpressions(node)) expression(child);
+        for (const nested of statementBlocks(node)) nested.forEach(statement);
+      };
+      const expression = (node: Expression): void => {
+        if (node.kind === 'call' && !isModifierCall(node)) {
+          throw new ParseError(`${capitalize(where(fn))} can't call resources: call them from an action`, node.line);
+        }
+        for (const child of childExpressions(node)) expression(child);
+        if (node.kind === 'view' && node.children) node.children.forEach(statement);
+      };
+      fn.body.forEach(statement);
+    }
   }
 
   /**
@@ -457,6 +598,7 @@ export class Parser {
     const seen = new Set<string>();
     while (!this.check(')')) {
       const nameToken = this.expect('identifier', 'as a parameter name');
+      this.checkName(nameToken.value, 'parameter', nameToken);
       if (seen.has(nameToken.value)) {
         throw this.error(`Duplicate parameter '${nameToken.value}'`, nameToken);
       }
@@ -581,7 +723,13 @@ export class Parser {
       default:
         // `emit` is not a keyword: it starts an emit statement only before a name, which no expression can.
         if (token.type === 'identifier' && token.value === 'emit' && this.peek(1).type === 'identifier') {
+          if (this.declarationKind === 'rendering') throw this.error('A rendering can\'t emit events');
           return this.parseEmit();
+        }
+        if (this.atProtected()) {
+          throw this.error(this.declarationKind === 'rendering'
+            ? `Protected variables are declared at the rendering's top level`
+            : `Protected variables can only be declared in a rendering`);
         }
         if (this.atFail()) {
           return this.parseFail();
@@ -590,8 +738,8 @@ export class Parser {
     }
   }
 
-  private parseVarDecl(constant: boolean): Statement {
-    const start = this.pos;
+  private parseVarDecl(constant: boolean, protectedVar = false): Statement {
+    const start = protectedVar ? this.pos - 1 : this.pos;
     const keyword = this.advance(); // var or const
     let state: { scope?: Expression } | undefined;
     if (this.atStateModifier()) {
@@ -599,8 +747,11 @@ export class Parser {
       if (constant) {
         throw this.error(`State variables must be declared with 'var'`, modifier);
       }
-      if (this.declarationKind !== 'contract') {
-        throw this.error(`State variables can only be declared in a contract`, modifier);
+      if (protectedVar) {
+        throw this.error(`A variable is either 'var state' or 'protected var', not both`, modifier);
+      }
+      if (this.declarationKind !== 'contract' && this.declarationKind !== 'rendering') {
+        throw this.error(`State variables can only be declared in a contract or a rendering`, modifier);
       }
       // The contract's top level, or the top of a function's body, where its scope can name the parameters.
       if (this.depth !== 1 && !(this.currentFunction && this.depth === 2)) {
@@ -614,13 +765,14 @@ export class Parser {
     }
     const nameToken = this.expect('identifier', `as the ${constant ? 'const' : 'var'} name`);
     const name = nameToken.value;
+    this.checkName(name, constant ? 'const' : 'var', nameToken);
 
     let type: TypeNode | undefined;
     if (this.match(':')) {
       // A non-builtin dotted type name is a resource reference declaration, unless it names a struct version.
       if (this.check('identifier') && !BUILTIN_TYPE_NAMES.has(this.peek().value) && !this.atStructType()) {
-        if (state) {
-          throw this.error(`A state variable can't hold a resource reference`, keyword);
+        if (state || protectedVar) {
+          throw this.error(`A ${state ? 'state' : 'protected'} variable can't hold a resource reference`, keyword);
         }
         return this.parseResourceDecl(constant, name, keyword, start);
       }
@@ -639,6 +791,7 @@ export class Parser {
     const statement: VarDeclStatement = { kind: 'varDecl', constant, name, value, line: keyword.line, tokens: 0 };
     if (type !== undefined) statement.type = type;
     if (state) statement.state = state;
+    if (protectedVar) statement.protected = true;
     return this.owned(statement, start, state?.scope ? [value, state.scope] : [value]);
   }
 
@@ -702,6 +855,9 @@ export class Parser {
     const next = this.peek();
     const hasValue = next.type !== '}' && next.type !== 'eof' && next.line === keyword.line;
     if (!hasValue) return this.owned({ kind: 'return', line: keyword.line, tokens: 0 }, start);
+    if (this.lambdaDepth > 0) {
+      throw this.error('An action returns nothing, so it can\'t return a value', keyword);
+    }
     const fn = this.currentFunction;
     if (fn && !fn.returnType) {
       throw this.error(
@@ -750,7 +906,8 @@ export class Parser {
     const startPos = this.pos;
     const start = this.peek();
     const expression = this.parseExpression();
-    if (this.match('=')) {
+    const operator = this.match('=') ?? this.match('+=') ?? this.match('-=');
+    if (operator) {
       if (expression.kind !== 'identifier' && expression.kind !== 'member' && expression.kind !== 'index') {
         throw this.error('Invalid assignment target', start);
       }
@@ -762,6 +919,7 @@ export class Parser {
         line: start.line,
         tokens: 0,
       };
+      if (operator.type !== '=') statement.operator = operator.type === '+=' ? '+' : '-';
       return this.owned(statement, startPos, [expression, value]);
     }
     return this.owned({ kind: 'exprStmt', expression, line: start.line, tokens: 0 }, startPos, [expression]);
@@ -841,10 +999,16 @@ export class Parser {
         this.expect(']', 'to end the index');
         expression = this.owned({ kind: 'index', object: expression, index, line: token.line, tokens: 0 }, start, [expression, index]);
       } else if (this.check('(') && expression.kind === 'member') {
+        const root = viewRoot(expression.object);
+        if (root) this.checkModifier(root, expression);
         const args = this.parseCallArguments();
+        if (root) this.checkModifierArguments(expression, args);
         const children = [expression, ...args.map((arg) => arg.value)];
         expression = this.owned({ kind: 'call', callee: expression as MemberExpr, args, line: token.line, tokens: 0 }, start, children);
       } else if (expression.kind === 'member' && this.atCallOptions(token)) {
+        if (this.declarationKind === 'rendering') {
+          throw this.error('A rendering can\'t attach money to calls');
+        }
         const options = this.parseCallOptions();
         if (!this.check('(')) {
           throw this.error('Call options must be followed by the call\'s arguments in parentheses');
@@ -857,6 +1021,92 @@ export class Parser {
         return expression;
       }
     }
+  }
+
+  /** A modifier written on a component: one the component takes. */
+  private checkModifier(root: ViewExpr, member: MemberExpr): void {
+    const spec = MODIFIERS[member.property];
+    if (!spec || !Object.hasOwn(MODIFIERS, member.property)) {
+      throw new ParseError(`Unknown modifier '${member.property}'`, member.line);
+    }
+    if (!spec.components.includes(root.component)) {
+      throw new ParseError(`${root.component} has no modifier '${member.property}'`, member.line);
+    }
+  }
+
+  private checkModifierArguments(member: MemberExpr, args: NamedArgument[]): void {
+    const spec = MODIFIERS[member.property]!;
+    if (args.length !== 1 || args[0]!.name !== spec.arg) {
+      throw new ParseError(`Modifier '${member.property}' takes one argument, '${spec.arg}': '.${member.property}(${spec.arg}: ...)'`, member.line);
+    }
+  }
+
+  /**
+   * A component, after its name: `(argument: value, ...)` when it takes arguments, then `{ ... }` holding its
+   * children when it takes them. Every argument is required, and an action argument is a lambda.
+   */
+  private parseView(name: Token, start: number): ViewExpr {
+    const spec = COMPONENTS[name.value]!;
+    const args: ViewArgument[] = [];
+    if (this.check('(') && this.peek().line === name.line) {
+      this.advance();
+      const seen = new Set<string>();
+      while (!this.check(')')) {
+        const argToken = this.expect('identifier', 'as an argument name');
+        const argSpec = spec.args.find((candidate) => candidate.name === argToken.value);
+        if (!argSpec) {
+          throw this.error(spec.args.length === 0
+            ? `${name.value} takes no arguments`
+            : `${name.value} has no argument '${argToken.value}': it takes ${describeArguments(spec)}`, argToken);
+        }
+        if (seen.has(argToken.value)) throw this.error(`Duplicate argument '${argToken.value}'`, argToken);
+        seen.add(argToken.value);
+        this.expect(':', 'after the argument name');
+        args.push(argSpec.type.kind === 'action'
+          ? { name: argToken.value, lambda: this.parseLambda(name.value, argToken.value, argSpec.type) }
+          : { name: argToken.value, value: this.parseExpression() });
+        if (!this.match(',')) break;
+      }
+      this.expect(')', `to end the arguments of ${name.value}`);
+    }
+    for (const argSpec of spec.args) {
+      if (!args.some((arg) => arg.name === argSpec.name)) {
+        throw new ParseError(`${name.value} needs argument '${argSpec.name}': it takes ${describeArguments(spec)}`, name.line);
+      }
+    }
+    const view: ViewExpr = { kind: 'view', component: name.value, args, line: name.line, tokens: 0 };
+    if (this.check('{')) {
+      if (!spec.children) throw this.error(`${name.value} has no children`);
+      view.children = this.parseBlock();
+    }
+    const children: object[] = [
+      ...args.map((arg) => ('value' in arg ? arg.value : arg.lambda)),
+      ...(view.children ?? []),
+    ];
+    return this.owned(view, start, children);
+  }
+
+  /** `(parameter: type, ...) => { ... }`, as action `arg` of `component`, declaring the parameters it is passed, or none. */
+  private parseLambda(component: string, arg: string, type: Extract<ViewArgumentType, { kind: 'action' }>): LambdaExpr {
+    const start = this.pos;
+    const open = this.peek();
+    const expected = `(${type.parameters.map((parameter) => `${parameter.name}: ${parameter.type}`).join(', ')}) => { ... }`;
+    if (open.type !== '(') {
+      throw this.error(`Argument '${arg}' of ${component} is an action: write '${expected}'`, open);
+    }
+    const parameters = this.parseParameterList(true);
+    const matches = parameters.length === 0
+      || (parameters.length === type.parameters.length && parameters.every((parameter, i) => typeToString(parameter.type) === type.parameters[i]!.type));
+    if (!matches) {
+      throw this.error(`The action of ${component} is passed ${type.parameters.length === 0 ? 'nothing' : type.parameters.map((parameter) => parameter.type).join(', ')}: write '${expected}'`, open);
+    }
+    this.expect('=>', 'after the action\'s parameters');
+    this.lambdaDepth++;
+    const body = this.parseBlock();
+    this.lambdaDepth--;
+    const lambda: LambdaExpr = { index: this.lambdas.length, parameters, body, names: freeNames(parameters, body), line: open.line, tokens: 0 };
+    this.lambdas.push(lambda);
+    return this.owned(lambda, start, body);
   }
 
   /** `{` on the line of the function name, starting `name:`, so it can't be a block or an object on its own line. */
@@ -953,11 +1203,14 @@ export class Parser {
       }
       case 'identifier': {
         this.advance();
+        if (this.declarationKind === 'rendering' && isComponent(token.value)) {
+          return this.parseView(token, start);
+        }
         // A name followed by `(` on its line calls one of the contract's functions; nothing else can.
         if (this.check('(') && this.peek().line === token.line) {
           const args = this.parseCallArguments();
           const call: FnCallExpr = { kind: 'fnCall', name: token.value, args, line: token.line, tokens: 0 };
-          this.fnCalls.push({ call, caller: this.currentFunction });
+          this.fnCalls.push({ call, caller: this.currentFunction, inLambda: this.lambdaDepth > 0 });
           return this.owned(call, start, args.map((arg) => arg.value));
         }
         return this.owned({ kind: 'identifier', name: token.value, line: token.line, tokens: 0 }, start);
@@ -998,6 +1251,8 @@ export class Parser {
       const parser = new Parser(part.tokens);
       parser.declarationKind = this.declarationKind;
       parser.currentFunction = this.currentFunction;
+      parser.lambdas = this.lambdas;
+      parser.lambdaDepth = this.lambdaDepth;
       const expression = parser.parseExpressionToEof();
       this.fnCalls.push(...parser.fnCalls);
       return { type: 'expr', expression };
@@ -1035,6 +1290,50 @@ export class Parser {
     this.expect(']', 'to end the list');
     return this.owned({ kind: 'listLiteral', elements, line: start.line, tokens: 0 }, startPos, elements);
   }
+}
+
+/** `Text(str: string)`, for error messages. */
+function describeArguments(spec: ComponentSpec): string {
+  return spec.args.map((arg) => `'${arg.name}'`).join(' and ');
+}
+
+/**
+ * The names a lambda's body reads that it doesn't declare itself, in the order it first reads them: the ones a
+ * render may need to capture for it.
+ */
+function freeNames(parameters: ParameterDecl[], body: Statement[]): string[] {
+  const declared = new Set(parameters.map((parameter) => parameter.name));
+  walkStatementsIn(body, (statement) => {
+    if (statement.kind === 'varDecl' || statement.kind === 'resourceDecl') declared.add(statement.name);
+  });
+  const names: string[] = [];
+  walkExpressions(body, (expression) => {
+    if (expression.kind === 'identifier' && !declared.has(expression.name) && !names.includes(expression.name)) names.push(expression.name);
+  });
+  return names;
+}
+
+/** The variable an assignment's target starts from: `a` in `a`, `a.b` and `a[0].b`. */
+function rootName(target: Expression): string | undefined {
+  if (target.kind === 'identifier') return target.name;
+  if (target.kind === 'member' || target.kind === 'index') return rootName(target.object);
+  return undefined;
+}
+
+/** The component a chain of modifiers starts from, `Text(...)` in `Text(...).color(...).fontSize(...)`. */
+function viewRoot(expression: Expression): ViewExpr | undefined {
+  if (expression.kind === 'view') return expression;
+  if (expression.kind === 'call') return viewRoot(expression.callee.object);
+  return undefined;
+}
+
+/** A call that applies a modifier to a component, rather than calling a resource. */
+function isModifierCall(expression: Expression): boolean {
+  return expression.kind === 'call' && viewRoot(expression.callee.object) !== undefined;
+}
+
+function capitalize(text: string): string {
+  return text.charAt(0).toUpperCase() + text.slice(1);
 }
 
 /** Any word, keywords included, as a path segment may be. */

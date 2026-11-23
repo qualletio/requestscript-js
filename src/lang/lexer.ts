@@ -87,7 +87,7 @@ export class Lexer {
 
     // Two-character operators
     const two = ch + this.peek(1);
-    if (two === '==' || two === '!=' || two === '<=' || two === '>=' || two === '&&' || two === '||') {
+    if (two === '==' || two === '!=' || two === '<=' || two === '>=' || two === '&&' || two === '||' || two === '=>' || two === '+=' || two === '-=') {
       this.advance();
       this.advance();
       return this.token(two, two, line, column);

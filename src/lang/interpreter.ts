@@ -8,14 +8,16 @@ import type {
   Expression,
   FnCallExpr,
   FunctionDecl,
+  LambdaExpr,
   Script,
   Statement,
   StructRef,
   VarDeclStatement,
+  ViewExpr,
 } from './ast.js';
 import { Decimal, DecimalArithmeticError } from './decimal.js';
 import { EntrypointError, ParameterError, RuntimeError, ScriptFailure } from './errors.js';
-import { EVENT_HANDLER, entrypoints } from './functions.js';
+import { EVENT_HANDLER, RENDER_FUNCTION, entrypoints } from './functions.js';
 import { TokenMeter } from './meter.js';
 import { KEYWORDS } from './token.js';
 import { MAX_STRUCT_DEPTH, structLabel, structReferences, type StructResolver } from './structs.js';
@@ -60,6 +62,7 @@ import {
   stringValue,
   type Value,
 } from './values.js';
+import { COMPONENTS, MODIFIERS, ROOT_VIEW, type ViewArgumentType, type ViewNode } from './views.js';
 
 export interface ResourceResolver {
   /**
@@ -202,6 +205,50 @@ export interface InterpretOptions {
    * it, `now` isn't declared: the interpreter never reads the clock itself, so a run replays the same way.
    */
   now?: number | bigint | Date;
+  /**
+   * Where a rendering's `protected var` variables are read from: the viewer's session. Without one, declaring
+   * one is a runtime error. The run doesn't write: it returns the final values in `InterpretResult.session`.
+   */
+  session?: SessionStore;
+  /**
+   * Runs one of a rendering's actions instead of `render`: the lambda `ActionHandle.lambda` names, with the
+   * values the render captured for it and the arguments its component passes, in order (a `TextField` passes
+   * its text). The rendering's top level runs first, as for any run.
+   */
+  action?: { lambda: number; captures?: Record<string, EncodedValue>; args?: unknown[] };
+  /**
+   * Called before each resource call when the run has changed a state or protected variable since it started,
+   * or since the last call: with their values as they are, so a rendering's host can show a render with them
+   * (a loading state) while the call runs. The run waits for it.
+   */
+  onBeforeInvoke?: (snapshot: { state: StateWrite[]; session: SessionWrite[] }) => Promise<void> | void;
+}
+
+export interface SessionStore {
+  /** The stored copy of protected variable `name` for the viewer's session, or undefined when there is none yet. */
+  get(name: string): Promise<StoredState | undefined>;
+}
+
+/** The final value of a protected variable the run declared. A host saves every write of a run, or none. */
+export interface SessionWrite {
+  name: string;
+  value: EncodedValue;
+  /** The variable's runtime type, as JSON. Store it with the value. */
+  type: string;
+  /** The stored copy's `version`, or undefined when the run initialized the variable. */
+  version?: unknown;
+}
+
+/**
+ * An action a render's UI may trigger: the host keeps it for the viewer and runs it, with
+ * `InterpretOptions.action`, when they do. `id` is what the UI tree's `actions` name.
+ */
+export interface ActionHandle {
+  id: string;
+  /** The lambda it runs: its index in the script's `lambdas`. */
+  lambda: number;
+  /** The values of the render's locals the lambda reads, as they were when it rendered. */
+  captures: Record<string, EncodedValue>;
 }
 
 /** An event type as the host knows it. Field types are type strings, as for resource functions. */
@@ -266,6 +313,17 @@ export interface InterpretResult {
   state: StateWrite[];
   /** The events the run emitted, for the host to publish. Empty without any. */
   events: EmittedEvent[];
+  /**
+   * The final values of the protected variables an action declared, for the host to keep in the viewer's
+   * session. Empty without any, and for a render, which changes nothing.
+   */
+  session: SessionWrite[];
+  /** A render's UI. Omitted for every other run. */
+  view?: ViewNode;
+  /** The actions a render's UI may trigger, in the order it wrote them. Omitted for every other run. */
+  actions?: ActionHandle[];
+  /** The lambda an action run ran. */
+  action?: number;
 }
 
 const IDENTIFIER = /^[A-Za-z_][A-Za-z0-9_]*$/;
@@ -393,7 +451,24 @@ export class Interpreter {
     private readonly stateStore?: StateStore,
     private readonly eventResolver?: EventResolver,
     private readonly structResolver?: StructResolver,
+    private readonly sessionStore?: SessionStore,
+    private readonly onBeforeInvoke?: InterpretOptions['onBeforeInvoke'],
   ) {}
+
+  /** What the current run does: run a script or contract, render a rendering, or run one of its actions. */
+  private mode: 'run' | 'render' | 'action' = 'run';
+
+  /** The protected variables declared in the current run, with their bindings. */
+  private sessionBindings: { name: string; binding: Binding; version?: unknown }[] = [];
+
+  /** While rendering, the children lists components are being written into, innermost last. */
+  private collectors: ViewNode[][] = [];
+
+  /** The actions the current render returned. */
+  private actions: ActionHandle[] = [];
+
+  /** The state and protected values `onBeforeInvoke` last saw, as JSON. */
+  private snapshotKey: string | undefined;
 
   /** The structs resolved in the current run, by label, each with every struct its fields name. */
   private structs = new Map<string, ResolvedStruct>();
@@ -417,7 +492,12 @@ export class Interpreter {
     script: Script,
     parameters?: Record<string, unknown>,
     builtins?: Record<string, unknown>,
-    context: { payment?: Payment | undefined; now?: number | bigint | Date | undefined; function?: string | undefined } = {},
+    context: {
+      payment?: Payment | undefined;
+      now?: number | bigint | Date | undefined;
+      function?: string | undefined;
+      action?: InterpretOptions['action'] | undefined;
+    } = {},
   ): Promise<InterpretResult> {
     if (script.declaration.kind === 'event') {
       throw new RuntimeError('An event declaration declares an event type; it does not run');
@@ -426,8 +506,14 @@ export class Interpreter {
       throw new RuntimeError('A struct declaration declares a struct; it does not run');
     }
     this.structs = new Map();
-    this.inContract = script.declaration.kind === 'contract';
-    const entry = this.selectEntrypoint(script, context.function);
+    const rendering = script.declaration.kind === 'rendering';
+    this.inContract = script.declaration.kind === 'contract' || rendering;
+    if (context.action !== undefined && !rendering) {
+      throw new EntrypointError('Only a rendering has actions to run');
+    }
+    this.mode = context.action !== undefined ? 'action' : rendering ? 'render' : 'run';
+    const lambda = context.action === undefined ? undefined : this.selectAction(script, context.action.lambda, context.function);
+    const entry = lambda ? undefined : this.selectEntrypoint(script, context.function);
     // Every struct the script names is resolved before anything runs, so an unknown one fails the run early.
     for (const ref of structReferences(script)) {
       await this.resolveStruct(ref, []);
@@ -441,13 +527,22 @@ export class Interpreter {
     const entryScope = entry ? new Environment(root) : root;
     await this.bindParameters(script.declaration, entry, parameters, entryScope);
     this.stateBindings = [];
+    this.sessionBindings = [];
     this.emitted = [];
+    this.actions = [];
+    this.collectors = [];
     this.functions = new Map(script.functions.map((fn) => [fn.name, fn]));
     this.contractScope = root;
 
     let result: Value = NULL_VALUE;
-    if (entry) {
+    const view: ViewNode = { type: ROOT_VIEW, props: {}, modifiers: {}, actions: {}, children: [] };
+    if (lambda) {
       await this.execStatements(script.body, root);
+      await this.execAction(lambda, context.action!, root);
+    } else if (entry) {
+      await this.execStatements(script.body, root);
+      this.snapshotKey = this.snapshot().key;
+      if (this.mode === 'render') this.collectors.push(view.children);
       result = await this.execFunction(entry, entryScope);
     } else {
       try {
@@ -457,14 +552,8 @@ export class Interpreter {
         result = error.value;
       }
     }
-    // In-place changes to lists and objects are in the bindings' values too.
-    const state = this.stateBindings.map(({ name, scope, binding, version }): StateWrite => ({
-      name,
-      scope,
-      value: encodeValue(binding.value),
-      type: JSON.stringify(binding.type),
-      ...(version === undefined ? {} : { version }),
-    }));
+    // A render changes nothing, so it writes nothing, even to the copies of lists and objects it read.
+    const { state, session } = this.mode === 'render' ? { state: [], session: [] } : this.snapshot();
     return {
       declaration: script.declaration,
       ...(entry ? { function: entry.name } : {}),
@@ -472,12 +561,85 @@ export class Interpreter {
       usage: { tokens: this.meter.tokens },
       state,
       events: this.emitted,
+      session,
+      ...(this.mode === 'render' ? { view, actions: this.actions } : {}),
+      ...(lambda ? { action: lambda.index } : {}),
     };
+  }
+
+  /** The state and protected variables' values as they are now: in-place changes to lists and objects included. */
+  private snapshot(): { state: StateWrite[]; session: SessionWrite[]; key: string } {
+    const state = this.stateBindings.map(({ name, scope, binding, version }): StateWrite => ({
+      name,
+      scope,
+      value: encodeValue(binding.value),
+      type: JSON.stringify(binding.type),
+      ...(version === undefined ? {} : { version }),
+    }));
+    const session = this.sessionBindings.map(({ name, binding, version }): SessionWrite => ({
+      name,
+      value: encodeValue(binding.value),
+      type: JSON.stringify(binding.type),
+      ...(version === undefined ? {} : { version }),
+    }));
+    const key = JSON.stringify([state.map((write) => [write.name, write.scope, write.value]), session.map((write) => [write.name, write.value])]);
+    return { state, session, key };
+  }
+
+  /** The lambda an action run runs. */
+  private selectAction(script: Script, index: number, name: string | undefined): LambdaExpr {
+    if (name !== undefined) throw new EntrypointError('An action run runs its lambda, so it names no function');
+    const lambda = Number.isSafeInteger(index) ? script.lambdas?.[index] : undefined;
+    if (!lambda) throw new EntrypointError(`The rendering has no action ${index}`);
+    return lambda;
+  }
+
+  /**
+   * Runs an action: its lambda's body, in a scope beneath the rendering's top level that holds the values the
+   * render captured and the arguments the component passes.
+   */
+  private async execAction(lambda: LambdaExpr, action: NonNullable<InterpretOptions['action']>, root: Environment): Promise<void> {
+    const scope = new Environment(root);
+    for (const [name, encoded] of Object.entries(action.captures ?? {})) {
+      if (!lambda.names.includes(name)) throw new ParameterError(`The action doesn't read '${name}', so it can't capture it`);
+      let value: Value;
+      try {
+        value = decodeValue(encoded);
+      } catch {
+        throw new ParameterError(`The captured value of '${name}' isn't an encoded value`);
+      }
+      scope.declare(name, { value, type: inferType(value), constant: true }, lambda.line);
+    }
+    const args = action.args ?? [];
+    if (lambda.parameters.length > 0) {
+      if (args.length !== lambda.parameters.length) {
+        throw new ParameterError(`The action takes ${lambda.parameters.length} argument${lambda.parameters.length === 1 ? '' : 's'}, not ${args.length}`);
+      }
+      lambda.parameters.forEach((parameter, i) => {
+        const value = parameterToValue(args[i], parameter.type, `for parameter '${parameter.name}' of the action`, this.structs);
+        scope.declare(parameter.name, { value, type: parameter.type, constant: true }, lambda.line);
+      });
+    }
+    this.snapshotKey = this.snapshot().key;
+    try {
+      await this.execStatements(lambda.body, new Environment(scope));
+    } catch (error) {
+      if (!(error instanceof ReturnSignal)) throw error;
+    }
   }
 
   /** The function a contract runs: the `pub` function the host names, or an event contract's handler. */
   private selectEntrypoint(script: Script, name: string | undefined): FunctionDecl | undefined {
     const declaration = script.declaration;
+    if (declaration.kind === 'rendering') {
+      const label = [...declaration.path, declaration.name].join('.');
+      if (name !== undefined && name !== RENDER_FUNCTION) {
+        throw new EntrypointError(`Rendering '${label}' runs '${RENDER_FUNCTION}' or one of its actions, not '${name}'`);
+      }
+      const render = script.functions.find((fn) => fn.name === RENDER_FUNCTION && fn.pub);
+      if (!render) throw new EntrypointError(`Rendering '${label}' has no '${RENDER_FUNCTION}'`);
+      return render;
+    }
     if (declaration.kind !== 'contract') {
       if (name !== undefined) throw new EntrypointError('Only a contract has functions to run');
       return undefined;
@@ -661,6 +823,30 @@ export class Interpreter {
     this.stateBindings.push({ name, scope, binding, version: stored?.version });
   }
 
+  /** Declares a protected variable: the session's stored copy, converted to its declared type, or else its initializer's value. */
+  private async declareProtected(statement: VarDeclStatement, env: Environment): Promise<void> {
+    const { name, line } = statement;
+    if (!this.sessionStore) {
+      throw new RuntimeError(`Protected variable '${name}' needs a host that keeps sessions`, line);
+    }
+    const stored = await this.sessionStore.get(name);
+    let value: Value;
+    let type: RuntimeType;
+    if (stored) {
+      const decoded = decodeValue(stored.value);
+      type = statement.type ?? (JSON.parse(stored.type) as RuntimeType);
+      await this.resolveStructs(type, line);
+      value = this.coerce(decoded, type, `in the stored value of protected variable '${name}'`, line);
+    } else {
+      value = requireData(await this.evaluate(statement.value, env), line);
+      type = statement.type ?? inferType(value);
+      if (statement.type) value = this.coerce(value, statement.type, `in the declaration of '${name}'`, line);
+    }
+    const binding: Binding = { value, type, constant: false };
+    env.declare(name, binding, line);
+    this.sessionBindings.push({ name, binding, version: stored?.version });
+  }
+
   /** The event type `ref` names, or a runtime error when the host has none. */
   private async resolveEvent(ref: EventRef, line?: number): Promise<EventType> {
     const label = eventLabel(ref);
@@ -748,6 +934,12 @@ export class Interpreter {
       }
       return;
     }
+    if (declaration.kind === 'rendering') {
+      if (parameters !== undefined && Object.keys(parameters).length > 0) {
+        throw new ParameterError(`'${RENDER_FUNCTION}' takes no parameters`);
+      }
+      return;
+    }
     if (declaration.kind !== 'contract') return;
 
     const provided = parameters ?? {};
@@ -801,6 +993,9 @@ export class Interpreter {
         if (statement.state) {
           return this.declareState(statement, env);
         }
+        if (statement.protected) {
+          return this.declareProtected(statement, env);
+        }
         const raw = await this.evaluate(statement.value, env);
         const value = requireData(raw, statement.line);
         const type: RuntimeType = statement.type ?? inferType(value);
@@ -833,7 +1028,7 @@ export class Interpreter {
         return;
       }
       case 'assign':
-        return this.execAssign(statement.target, statement.value, statement.line, env);
+        return this.execAssign(statement.target, statement.value, statement.line, env, statement.operator);
       case 'return': {
         const value = statement.value
           ? requireData(await this.evaluate(statement.value, env), statement.line)
@@ -860,9 +1055,16 @@ export class Interpreter {
         }
         return;
       }
-      case 'exprStmt':
-        await this.evaluate(statement.expression, env);
+      case 'exprStmt': {
+        const value = await this.evaluate(statement.expression, env);
+        // A component written as a statement is shown: added to the UI where it was written.
+        if (value.kind === 'view') {
+          const collector = this.collectors.at(-1);
+          if (!collector) throw new RuntimeError('Components can only be written while rendering', statement.line);
+          collector.push(value.node);
+        }
         return;
+      }
       case 'emit':
         return this.execEmit(statement, env);
       case 'fail': {
@@ -905,8 +1107,12 @@ export class Interpreter {
     valueExpr: Expression,
     line: number,
     env: Environment,
+    operator?: '+' | '-',
   ): Promise<void> {
-    const value = requireData(await this.evaluate(valueExpr, env), line);
+    const operand = requireData(await this.evaluate(valueExpr, env), line);
+    // `x += v` is `x = x + v`, with the target found once.
+    const combine = (current: Value | undefined): Value =>
+      operator === undefined ? operand : this.applyOperator(operator, current ?? NULL_VALUE, operand, line);
 
     // The target is never evaluated as a whole, so its own tokens are charged here.
     this.meter.charge(target.tokens, line);
@@ -917,7 +1123,7 @@ export class Interpreter {
         if (binding.constant) {
           throw new RuntimeError(`Cannot assign to '${target.name}' because it is a const`, line);
         }
-        binding.value = this.coerce(value, binding.type, `in assignment to '${target.name}'`, line);
+        binding.value = this.coerce(combine(binding.value), binding.type, `in assignment to '${target.name}'`, line);
         return;
       }
       case 'member': {
@@ -931,7 +1137,7 @@ export class Interpreter {
         if (object.readonly) {
           throw new RuntimeError(`Cannot set property '${target.property}' because the object is read-only`, line);
         }
-        object.entries.set(target.property, value);
+        object.entries.set(target.property, combine(object.entries.get(target.property)));
         return;
       }
       case 'index': {
@@ -944,7 +1150,7 @@ export class Interpreter {
           throw new RuntimeError('Cannot set an element because the list is read-only', line);
         }
         const i = this.indexNumber(index, object.elements.length, line);
-        object.elements[i] = value;
+        object.elements[i] = combine(object.elements[i]);
         return;
       }
     }
@@ -967,6 +1173,8 @@ export class Interpreter {
     this.signal?.throwIfAborted();
     this.meter.charge(expression.tokens, expression.line);
     switch (expression.kind) {
+      case 'view':
+        return this.evalView(expression, env);
       case 'intLiteral': {
         const value = expression.value;
         if (value >= INT32_MIN && value <= INT32_MAX) return int32Value(Number(value));
@@ -1076,6 +1284,10 @@ export class Interpreter {
     // The callee is never evaluated as a whole, so its own tokens are charged here.
     this.meter.charge(expression.callee.tokens, expression.line);
     const target = await this.evaluate(expression.callee.object, env);
+    if (target.kind === 'view') return this.applyModifier(target.node, expression, env);
+    if (this.mode === 'render') {
+      throw new RuntimeError(`'${RENDER_FUNCTION}' can't call resources: call them from an action`, expression.line);
+    }
     if (target.kind !== 'resource') {
       throw new RuntimeError(`Cannot call '${expression.callee.property}' on ${valueTypeName(target)}`, expression.line);
     }
@@ -1116,6 +1328,7 @@ export class Interpreter {
       ? undefined
       : await this.resourceType(fn.returnType, `return type of function '${fn.name}'`, expression.line);
 
+    await this.beforeInvoke();
     this.signal?.throwIfAborted();
     let raw: unknown;
     try {
@@ -1132,6 +1345,94 @@ export class Interpreter {
 
     if (returnType === undefined) return resultValue(NULL_VALUE, null);
     return resultValue(hostToValue(result.value, returnType, `returned from '${fn.name}'`, this.structs), null);
+  }
+
+  /** Tells the host about state and protected values the run changed since it last told it, before a call. */
+  private async beforeInvoke(): Promise<void> {
+    if (!this.onBeforeInvoke) return;
+    const snapshot = this.snapshot();
+    if (snapshot.key === this.snapshotKey) return;
+    this.snapshotKey = snapshot.key;
+    await this.onBeforeInvoke({ state: snapshot.state, session: snapshot.session });
+  }
+
+  /**
+   * Builds a component: checks its arguments, turns its lambdas into the render's action handles, and runs its
+   * children's block with the component collecting what it writes.
+   */
+  private async evalView(expression: ViewExpr, env: Environment): Promise<Value> {
+    const { line } = expression;
+    if (this.mode !== 'render') {
+      throw new RuntimeError(`Components can only be built while rendering, not ${this.mode === 'action' ? 'in an action' : 'here'}`, line);
+    }
+    const spec = COMPONENTS[expression.component]!;
+    const node: ViewNode = { type: expression.component, props: {}, modifiers: {}, actions: {}, children: [] };
+    for (const arg of expression.args) {
+      const argSpec = spec.args.find((candidate) => candidate.name === arg.name)!;
+      if ('lambda' in arg) {
+        node.actions[arg.name] = this.actionHandle(arg.lambda, env);
+        continue;
+      }
+      const value = requireData(await this.evaluate(arg.value, env), line);
+      node.props[arg.name] = this.viewValue(value, argSpec.type, argSpec.check, `argument '${arg.name}' of ${expression.component}`, line);
+    }
+    if (expression.children) {
+      this.collectors.push(node.children);
+      try {
+        await this.execStatements(expression.children, new Environment(env));
+      } finally {
+        this.collectors.pop();
+      }
+    }
+    return { kind: 'view', node };
+  }
+
+  /** Registers an action handle for a lambda, capturing the values of the render's locals it reads. */
+  private actionHandle(lambda: LambdaExpr, env: Environment): string {
+    const captures: Record<string, EncodedValue> = {};
+    for (const name of lambda.names) {
+      const binding = env.lookup(name);
+      // Built-ins and the rendering's top level are there when the action runs, so only locals are captured.
+      if (!binding || binding.builtin || this.contractScope?.lookup(name) === binding) continue;
+      if (binding.value.kind === 'resource') {
+        throw new RuntimeError(`An action can't capture resource '${name}': bind it at the rendering's top level`, lambda.line);
+      }
+      captures[name] = encodeValue(binding.value);
+    }
+    const id = String(this.actions.length);
+    this.actions.push({ id, lambda: lambda.index, captures });
+    return id;
+  }
+
+  /** A component's or modifier's argument, checked against its type, as JSON. Null means none. */
+  private viewValue(value: Value, type: ViewArgumentType, check: ((value: unknown) => string | undefined) | undefined, what: string, line: number): unknown {
+    if (type.kind === 'action') throw new RuntimeError(`${what} is an action`, line);
+    const json = valueToJson(this.coerce(value, { kind: type.kind }, `for ${what}`, line));
+    if (json !== null && check) {
+      const problem = check(json);
+      if (problem) throw new RuntimeError(`${capitalize(what)} ${problem}, not ${JSON.stringify(json)}`, line);
+    }
+    return json;
+  }
+
+  /** Applies a modifier to a component, returning the modified component. A null value leaves it unset. */
+  private async applyModifier(node: ViewNode, expression: CallExpr, env: Environment): Promise<Value> {
+    const { line } = expression;
+    const name = expression.callee.property;
+    const spec = Object.hasOwn(MODIFIERS, name) ? MODIFIERS[name] : undefined;
+    if (!spec || !spec.components.includes(node.type)) {
+      throw new RuntimeError(`${node.type} has no modifier '${name}'`, line);
+    }
+    const arg = expression.args.find((candidate) => candidate.name === spec.arg);
+    if (!arg || expression.args.length !== 1) {
+      throw new RuntimeError(`Modifier '${name}' takes one argument, '${spec.arg}'`, line);
+    }
+    const value = requireData(await this.evaluate(arg.value, env), line);
+    const json = this.viewValue(value, spec.type, spec.check, `modifier '${name}'`, line);
+    const modifiers = { ...node.modifiers };
+    if (json === null) delete modifiers[name];
+    else modifiers[name] = json;
+    return { kind: 'view', node: { ...node, modifiers } };
   }
 
   /** A resource function's parameter or return type, parsed from its type string, with its structs resolved. */
@@ -1167,7 +1468,11 @@ export class Interpreter {
 
     const left = await this.evaluate(expression.left, env);
     const right = await this.evaluate(expression.right, env);
+    return this.applyOperator(operator, left, right, line);
+  }
 
+  /** Applies a binary operator other than `&&` and `||` to two values. */
+  private applyOperator(operator: Exclude<BinaryExpr['operator'], '&&' | '||'>, left: Value, right: Value, line: number): Value {
     switch (operator) {
       case '==':
         return booleanValue(valuesEqual(left, right));
@@ -1342,6 +1647,10 @@ export function valuesEqual(a: Value, b: Value): boolean {
   }
 }
 
+function capitalize(text: string): string {
+  return text.charAt(0).toUpperCase() + text.slice(1);
+}
+
 /** `path.Name` or `path.Name@version`. */
 export function eventLabel(ref: EventRef): string {
   const name = [...ref.path, ref.name].join('.');
@@ -1364,6 +1673,13 @@ export async function interpretParsed(script: Script, options: InterpretOptions 
     options.state,
     options.events,
     options.structs,
+    options.session,
+    options.onBeforeInvoke,
   );
-  return interpreter.run(script, options.parameters, options.builtins, { payment: options.payment, now: options.now, function: options.function });
+  return interpreter.run(script, options.parameters, options.builtins, {
+    payment: options.payment,
+    now: options.now,
+    function: options.function,
+    action: options.action,
+  });
 }

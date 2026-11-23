@@ -81,6 +81,8 @@ export function valueTypeName(value: Value): string {
       return value.elements.length > 0 ? `[]${valueTypeName(value.elements[0]!)}` : '[]';
     case 'resource':
       return `resource ${value.resource.name}`;
+    case 'view':
+      return `component ${value.node.type}`;
     default:
       return value.kind;
   }
@@ -128,6 +130,8 @@ export function inferType(value: Value): RuntimeType {
     }
     case 'resource':
       throw new RuntimeError('A resource reference cannot be used as a value');
+    case 'view':
+      throw new RuntimeError('A component can only be shown where it is written, not kept in a variable');
   }
 }
 
@@ -243,6 +247,8 @@ export function displayString(value: Value): string {
       return JSON.stringify(valueToJson(value));
     case 'resource':
       throw new RuntimeError('A resource reference cannot be converted to a string');
+    case 'view':
+      throw new RuntimeError('A component can only be shown where it is written, not converted to a string');
   }
 }
 
@@ -282,6 +288,8 @@ export function valueToJson(value: Value): unknown {
     }
     case 'resource':
       throw new RuntimeError('A resource reference cannot be returned or encoded');
+    case 'view':
+      throw new RuntimeError('A component can only be shown where it is written, not returned');
   }
 }
 
@@ -482,6 +490,8 @@ export function valueToHost(value: Value): unknown {
     }
     case 'resource':
       throw new RuntimeError('A resource reference cannot be passed to a resource function');
+    case 'view':
+      throw new RuntimeError('A component can only be shown where it is written, not passed to a resource function');
   }
 }
 
@@ -513,6 +523,8 @@ export function encodeValue(value: Value): EncodedValue {
     }
     case 'resource':
       throw new RuntimeError('A resource reference cannot be stored');
+    case 'view':
+      throw new RuntimeError('A component can only be shown where it is written, not stored');
   }
 }
 
